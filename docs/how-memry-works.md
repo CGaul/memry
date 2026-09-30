@@ -201,8 +201,8 @@ Public APIs still call a memory's tags `categories`. Each tag is an entity of ty
 one per user and normalized name, and every memory filed under it mentions it. The
 `categories` column and the legacy `topics`/`memory_topics` index, which the filters read,
 are written from the same tags. Two tags merge through the tag question (each shown with
-its 10 most recent memories); a tag and a named thing of the same name ("bildy" and the
-product Bildy) through the entity pair question. A tag is never a hub and never what a
+its 10 most recent memories); a tag and a named thing of the same name ("zobly" and the
+product Zobly) through the entity pair question. A tag is never a hub and never what a
 search is about.
 
 - The dashboard's Upkeep > Entities lists tags with the people and things, filtered by

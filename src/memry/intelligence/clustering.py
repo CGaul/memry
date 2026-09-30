@@ -232,14 +232,14 @@ def semantic_duplicate_tags(
 
     - **member centroids** (always): the two tags' memories occupy the same
       region of embedding space. Alone this is not enough. Measured on a real
-      149-memory store, one centroid threshold either reported nothing (0.93)
-      or proposed wrong merges like career+preference (0.80) while still
+      store, one centroid threshold either reported nothing (strict) or
+      proposed wrong merges like career+preference (loose) while still
       missing the real split - personal stores are topically dense, so
       *different* tags about one life also sit close together.
     - **label similarity** (when ``labels`` is given): the tag names themselves
-      mean the same thing. The conjunction was surgical on the same store:
-      exactly the one true split (tech/technical, centroid 0.994) and nothing
-      else. With labels available, the centroid requirement relaxes to
+      mean the same thing. The conjunction found the true split
+      (tech/technical) and nothing else. With labels available, the centroid
+      requirement relaxes to
       ``paired_centroid_threshold``; without them, the strict ``threshold``
       applies alone.
     - **low co-occurrence** (always): complementary tags ("kitchen remodel" /

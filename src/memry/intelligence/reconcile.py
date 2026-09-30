@@ -135,24 +135,18 @@ def _normalize(text: str) -> str:
 
 
 #: CHANGED carries two worked examples, a plan that then happened and a status
-#: that moved on. Without them Jev read a plan followed by its outcome ("is
-#: planning to run the marathon in April", then "ran the marathon") as MORE
-#: at 0.34 to 0.80, mostly under MORE's bar, so the plan stayed in use beside
-#: what happened. With them (``evals/reconcile_benchmark.py``, the questions
-#: of two cases runs asked again, two runs each) those answers were CHANGED at
-#: 0.54 to 0.81, and a renovation started, then finished, CHANGED at 0.75 to
-#: 0.98; the plan cases ended right in 3 of 4 in both layouts in two runs.
-#: Recurring events stayed NEW, added details MORE and corrections WRONG, and
-#: the measured bars (``JevDecider.reconcile_bars``) still fit the labelled
-#: answers. The cost: a plan followed by a later stage ("plans to apply", then
-#: "was accepted, starting in the fall", then "started"), which MORE merged at
-#: 0.46 to 0.90, is MORE at 0.24 to 0.69 and stays beside the plan. An example
-#: in MORE as well lowered MORE on real added details, so MORE has none.
-#: MORE worded as "about the same event or thing", with NEW as "another event
-#: or thing of the same kind, before or after it", was asked of the MORE
-#: merges of the LoCoMo stores (two runs): it left the merges of two trips or
-#: games where they were and stopped a few right ones, so the question stays
-#: and the merge writer keeps such pairs apart (``MERGE_REQUEST``).
+#: that moved on. Without them Jev reads a plan followed by its outcome ("is
+#: planning to run the marathon in April", then "ran the marathon") as MORE,
+#: mostly under MORE's bar, so the plan stays in use beside what happened.
+#: With them (measured with ``evals/reconcile_benchmark.py``) those answers are
+#: CHANGED; recurring events stay NEW, added details MORE and corrections
+#: WRONG, and the measured bars (``JevDecider.reconcile_bars``) still fit. The
+#: cost: a plan followed by a later stage ("plans to apply", then "was
+#: accepted, starting in the fall", then "started") is less often merged and
+#: can stay beside the plan. An example in MORE as well lowered MORE on real
+#: added details, so MORE has none. Rewording MORE and NEW did not keep two
+#: events of one kind apart either, so the question stays and the merge writer
+#: keeps such pairs apart (``MERGE_REQUEST``).
 ACTION_QUESTION = Choice(
     instructions=("Each EXISTING memory was said on the date shown; the NEW fact was just "
                   "said, on its date. What is the NEW fact, compared with the existing "
@@ -245,7 +239,7 @@ def _decide_action(
 #: stored as NEW (``Merged.apart``). Jev's MORE on two different trips,
 #: games or injuries is as sure as on a detail added to one, so no bar tells
 #: them apart; the writer, reading both texts with their dates, tells many of
-#: them apart (PhD notes, reconcile-more).
+#: them apart.
 MERGE_REQUEST = ('The answer is MORE of memory [0]: reply with action "MORE", target 0 and, as '
                  "content, the merged text. If the NEW fact is about another event or thing "
                  "than memory [0], of the same kind (another trip, game, purchase or photo), do "

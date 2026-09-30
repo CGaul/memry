@@ -1825,9 +1825,9 @@ class MemoryStore:
 
         Only a hub counts (``_is_hub``): a stray phrase stored as an entity
         does not decide what a search is about. Of the hubs named, those
-        whose name another's holds are dropped ("bildy v4", not also
-        "bildy": a search from bildy reaches every version below it). The
-        hubs are kept first, so a stray name holding a hub's ("bildy sync")
+        whose name another's holds are dropped ("zobly v4", not also
+        "zobly": a search from zobly reaches every version below it). The
+        hubs are kept first, so a stray name holding a hub's ("zobly sync")
         does not hide it. A question naming no hub that speaks in the first
         person ("Where do I live?") is about the store's owner, when the
         owner is one."""
@@ -2202,10 +2202,10 @@ class MemoryStore:
         def text_of(result: SearchResult) -> str:
             # "it" stands for the entity a memory's aboutness comes from and
             # the things that entity more likely than not belongs to ("The
-            # first release of bildy" in a memory of bildy v1). Every other
+            # first release of zobly" in a memory of zobly v1). Every other
             # name stays: it can be the answer ("uses Redis"), someone else
             # ("Kai Lund works on it", not "it works on it") or another
-            # entity ("Bildy Bakery").
+            # entity ("Zobly Bakery").
             who = subject(result.memory.id) if masking else None
             if who is None:
                 return result.memory.content
@@ -2257,8 +2257,8 @@ class MemoryStore:
         # What is true of the thing a seed belongs to holds for the seed only
         # where nothing nearer says otherwise: an answer reached by a step up
         # counts as far as none of the seed's own memories answers, nor one of
-        # a thing between them. bildy v4, a version of bildy v3 and of bildy,
-        # takes v3's change over bildy's default, as v3 does. A thing is
+        # a thing between them. zobly v4, a version of zobly v3 and of zobly,
+        # takes v3's change over zobly's default, as v3 does. A thing is
         # between when the seed more likely than not belongs to it and it to
         # the thing the answer is about (``homes_of``); a sibling reached
         # through the thing is not. Both relevance and that override are per
@@ -2331,8 +2331,8 @@ class MemoryStore:
         most. The best are taken, a tie at the cut by the property ranking,
         over the tied candidates the newest first (then by memory id) as many
         as places are left and ``SET_TIE_MARGIN`` more (a tie of hundreds, one
-        topic's share, is not scored whole). Measured on the dense world's set
-        questions, those held 85 to 100% of each set within 100 candidates.
+        topic's share, is not scored whole). Measured, those hold most of each
+        set within the budget.
 
         Where the topics give fewer than the budget (the first share none: an
         untagged store, memories saved with ``infer=False`` or imported
@@ -2676,9 +2676,9 @@ class MemoryStore:
         """Content-free aggregate graph over every active memory in scope.
 
         A planet is a hub that came up at least twice; a person is one from the
-        first mention. On a real store the hubs alone were still 1,424 planets,
-        610 of them things typed as a product or project and seen exactly once,
-        so the map asks for a second sighting and the list does not. A part
+        first mention. On a real store the hubs alone are far too many planets,
+        many of them things typed as a product or project and seen exactly
+        once, so the map asks for a second sighting and the list does not. A part
         that has a home is not a planet of its own: it rides along on its home
         as one of its ``parts``. Nothing is hidden for good, since all of this
         is recomputed from the memories each time.
@@ -2766,11 +2766,11 @@ class MemoryStore:
 
     def _entity_vocabulary(self, scope: Scope, text: str) -> list[tuple[str, str | None]]:
         """Existing entities a text may be naming, offered to extraction as
-        (name, type) so it writes their names as stored. On 11 texts that
-        named a stored entity another way ("bildy.ai", "AWS", "Prof. Olsen"),
-        extraction wrote the stored name 11 times with the offer and once
-        without; on 7 texts about a new thing with a look-alike name ("Kestrel
-        Capital", "Priya Sharma") it used a stored name 0 times either way.
+        (name, type) so it writes their names as stored. With the offer, a
+        text that names a stored entity another way ("zobly.ai", "AWS",
+        "Prof. Olsen") gets the stored name; a text about a new thing with a
+        look-alike name ("Veldmark Capital", "Priya Sharma") does not take a
+        stored one.
         """
         if not text.strip():
             return []
@@ -4033,7 +4033,7 @@ class MemoryStore:
 
         Then drop entities nothing references. Extraction inevitably produces
         some records that never attach to anything, and without this they
-        accumulate forever: a real store reached 206 such rows out of 519.
+        accumulate forever: in a real store they become a large share of all rows.
         """
         scope = Scope(user_id=user_id)
         # Surface duplicates first: proposals are otherwise only made at write
@@ -4221,8 +4221,8 @@ class MemoryStore:
         ``into`` is read as a column files it (``MemoryBackend.tag_filing``):
         a name merged away means its survivor, never a fresh topic of a
         retired name. After "tax" went into "levies", merging "taxes" into
-        "tax" merges it into "levies"; after "bildy" the tag went into
-        "Bildy" the product, merging "bildy app" into "bildy" folds it into
+        "tax" merges it into "levies"; after "zobly" the tag went into
+        "Zobly" the product, merging "zobly app" into "zobly" folds it into
         the product. The names merged away resolve among the active topics
         only, never through a tombstone: a name merged away before names
         nothing to merge again ("taxes" into "tax", then "taxes" into
@@ -4559,7 +4559,7 @@ class MemoryStore:
         # (identity.TAG_QUESTION: each tag shown with its 10 most recent
         # memories, both orders, at the judge's tag merge bar), asked about
         # every pair of the tags left, when at most 20 are left. The names
-        # alone read two subjects as one: "memry" as a typo of "memory" (0.98).
+        # alone read two subjects as one: "memry" as a typo of "memory".
         names = [str(t["category"]).strip().lower() for t in tags]
         names = [n for n in names if n and n not in seen]
         candidates = [(a, b) for i, a in enumerate(names) for b in names[i + 1:]]

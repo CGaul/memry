@@ -163,10 +163,10 @@ def test_small_stores_are_unaffected(store):
 def test_label_conjunction_blocks_topically_close_but_distinct_tags():
     """Different tags about one life sit close in vector space.
 
-    Measured on a real 149-memory store: centroid similarity alone at 0.80
-    proposed merging `career` with `preference` while still missing the true
-    split. Requiring the LABELS to also mean the same thing fired on exactly
-    tech/technical and nothing else.
+    Measured on a real store: centroid similarity alone, set loose, proposed
+    merging `career` with `preference` while still missing the true split.
+    Requiring the LABELS to also mean the same thing fired on tech/technical
+    and nothing else.
     """
     centroids = {
         "career": _unit(1.0, 0.10, 0.0),

@@ -277,7 +277,7 @@ def extract_facts(
 
     ``entity_names`` are existing entities the conversation may be naming, as
     (name, type). A fact that names one of them writes its name as stored, so
-    "Fundation" does not become a second entity beside "Fundation GmbH".
+    "Veldmark" does not become a second entity beside "Veldmark GmbH".
 
     ``vocabulary`` is the tags this namespace already uses. Offering them is
     what keeps tagging convergent: extraction that cannot see the existing

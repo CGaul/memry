@@ -72,14 +72,14 @@ class _SenseEmbedder(Embedder):
       and "Windows", "think" and "loved").
     - "it" and "its" count as the word they are: a text emptied of its names
       ("it met it at the gym") is near another emptied text ("What did it
-      think of it?"). Measured with OpenAI vectors, masked "it works on it."
-      and "it liked the food at it." outranked the answer to "What does Raj
-      Osei like?" (registry R-113), and "Did it like it?" put every liked
-      restaurant above the one asked about (R-35).
+      think of it?"). With real vectors, masked "it works on it." and "it
+      liked the food at it." can outrank the answer to "What does Raj Osei
+      like?", and "Did it like it?" puts every liked restaurant above the one
+      asked about.
     - A name's words weigh ``name_weight`` times a word: an embedder follows
       names.
-    - A number is a number: the vectors cannot tell 2024-117 from 2024-118
-      (registry R-21), only the keyword search can.
+    - A number is a number: the vectors cannot tell 2024-117 from 2024-118,
+      only the keyword search can.
     - Every other word lands in one of ``FILLER`` dimensions, so a longer text
       is less near a short question, as with real vectors.
     """
@@ -252,7 +252,7 @@ def _through_the_judged_pool(store, query, *, limit=5, **filters):
     return plan, results, store._search_linked(query, reads.scope, results, False, plan=plan)
 
 
-# ================================================================== R-35
+# ================================================= several hubs named
 # "Did Ilva Marsh like Olive Kitchen?" must not be read "Did it like it?".
 # With several hubs named, the question the order and the judge read keeps
 # their names (``MemoryStore._plan``), and the linked order compares it with
@@ -325,7 +325,7 @@ def _several_things_are_answered(store, answer):
 
 
 def test_gap_a_question_naming_several_things_keeps_their_names_in_the_linked_order(stores):
-    """R-35 / S16-S18 at the linked order. "What did Ilva Marsh think of
+    """At the linked order. "What did Ilva Marsh think of
     Olive Kitchen?" names two hubs. Masked over both it reads "What did it
     think of it?": nearer that are her 12 opinions of other restaurants
     ("it loved the curry at it") and her 40 meetings ("it met it at the
@@ -347,12 +347,12 @@ def test_a_question_naming_several_things_is_ordered_as_written(stores):
     assert answer.id in _ids(ranked)[:store.config.decision.rerank_pool]
 
 
-# ================================================================== R-21
+# ========================================== an identifier only words match
 # An identifier only the keyword search matches ("invoice 2024-117") keeps a
 # place among the 20 the judge reads, on every search, judged or not
 # (``MemoryStore._with_the_keyword_place``). a06db33 built it into the linked
 # search only, so at ce2b49f it held for a question naming a hub and not for
-# the registry's scenario, which names none ("invoice 2024-117 untagged"):
+# a question that names none ("invoice 2024-117 untagged"):
 # judged on the text ranking as it stood, by ``_judge_ranking`` or ``_rerank``.
 INVOICE_QUESTION = "Did we pay invoice 2024-117?"
 
@@ -393,7 +393,7 @@ def _the_identifier_is_answered(store, answer, route):
 @pytest.mark.parametrize("route", ["judge", "rerank"])
 def test_gap_an_identifier_only_the_words_match_reaches_the_judge_on_the_text_route(
         stores, route):
-    """R-21 for a question naming no hub. 65 memories about paying invoices
+    """For a question naming no hub. 65 memories about paying invoices
     and bills are nearer "Did we pay invoice 2024-117?" by vector, and the
     invoices match two of its words; the answer matches three (the
     identifier), by keyword alone, and is two months older. The fused ranking
@@ -419,78 +419,78 @@ def test_the_best_keyword_match_keeps_a_place_in_the_judged_pool(stores, judged)
     assert _ids(ranked).index(answer.id) == store.config.decision.rerank_pool - 1
 
 
-# ================================================================== R-12
+# ============================================= only a hub seeds the search
 # Only a hub starts the linked search: a stray phrase stored as an entity does
 # not decide what a search is about (``MemoryStore._is_hub``). The hubs are
 # kept first and the longest-name rule runs among them (``_seeds``,
 # ``graph_retrieval.longest_names``). At ce2b49f the longest-name rule ran
 # first (``detect_query_entities(longest=True)``): a stray entity whose name
-# holds a hub's ("bildy sync", one memory, no type) hid the hub, and a question
-# about bildy was searched as naming nothing. The test of 063cb97 used
+# holds a hub's ("zobly sync", one memory, no type) hid the hub, and a question
+# about zobly was searched as naming nothing. The test of 063cb97 used
 # "budget", which holds no hub's name, in a store of 3 memories.
-SYNC_QUESTION = "Does bildy sync work offline?"
-SYNC_ANSWER = "bildy keeps working without a network since v3"
+SYNC_QUESTION = "Does zobly sync work offline?"
+SYNC_ANSWER = "zobly keeps working without a network since v3"
 APPS = ["Kaven planner", "Luma notes", "Orbit mail", "Tessel tasks", "Quill docs",
         "Brio calendar", "Nimbo drive", "Sable chat", "Vanta boards", "Pico wiki",
         "Rook sheets", "Dune photos", "Fable reader", "Mosaic crm", "Umber todo"]
 
 
 def _a_stray_name_holds_a_hub(stores):
-    """bildy, a product with 20 memories and the answer, and a stray entity
-    "bildy sync" that extraction took from one of them; 60 notes on whether
+    """zobly, a product with 20 memories and the answer, and a stray entity
+    "zobly sync" that extraction took from one of them; 60 notes on whether
     other apps sync offline, which match the question's words better and
     name nothing the store knows: 81 memories."""
-    store = stores(_SenseEmbedder(names=["bildy"]))
-    bildy = _entity(store, "bildy", "product")
-    stray = _entity(store, "bildy sync")
-    answer = _remember(store, SYNC_ANSWER, [bildy], days_ago=30)
-    _remember(store, "bildy sync keeps failing on Mondays", [bildy, stray])
+    store = stores(_SenseEmbedder(names=["zobly"]))
+    zobly = _entity(store, "zobly", "product")
+    stray = _entity(store, "zobly sync")
+    answer = _remember(store, SYNC_ANSWER, [zobly], days_ago=30)
+    _remember(store, "zobly sync keeps failing on Mondays", [zobly, stray])
     for day in ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]:
-        _remember(store, f"bildy crashed on {day} after the update", [bildy])
+        _remember(store, f"zobly crashed on {day} after the update", [zobly])
     for fact in ["is written in Go", "stores its data in SQLite", "is led by Mara Ruiz",
                  "is released under the MIT license", "has a dark theme",
                  "exports notes as Markdown", "ships every two weeks",
                  "has 4,000 users", "started in 2021", "has a public roadmap",
                  "charges 5 euros a month", "runs a Discord server", "has a web clipper"]:
-        _remember(store, f"bildy {fact}", [bildy])
+        _remember(store, f"zobly {fact}", [zobly])
     for app in APPS:
         for tail in ["sync works offline", "sync does not work offline on the train",
                      "sync works offline since the update", "sync needs work offline"]:
             _remember(store, f"The {app} {tail}")
-    assert store._is_hub(bildy.id) and not store._is_hub(stray.id)
-    return store, bildy, answer
+    assert store._is_hub(zobly.id) and not store._is_hub(stray.id)
+    return store, zobly, answer
 
 
-def _the_hub_is_searched(store, bildy, answer):
+def _the_hub_is_searched(store, zobly, answer):
     scope = Scope(user_id=USER)
-    assert bildy.id in detect_query_entities(store.backend, scope, SYNC_QUESTION)
+    assert zobly.id in detect_query_entities(store.backend, scope, SYNC_QUESTION)
     assert answer.id not in _text(store, SYNC_QUESTION)[:20]  # the words alone do not find it
     store.decider = judge = _Judge(scores={"without a network": 0.9}, rest=0.05)
     results = store.search(SYNC_QUESTION, user_id=USER, limit=5)
-    assert "about" in results[0].signals, "the linked search did not start at bildy"
-    assert answer.content.replace("bildy", "it") in judge.read
+    assert "about" in results[0].signals, "the linked search did not start at zobly"
+    assert answer.content.replace("zobly", "it") in judge.read
     assert results[0].memory.id == answer.id
 
 
 def test_gap_a_stray_name_holding_a_hubs_name_does_not_hide_the_hub(stores):
-    """R-12 at the seeds. "Does bildy sync work offline?" names bildy, a hub,
-    and "bildy sync", a stray entity of one memory. At ce2b49f the longer
-    stray name dropped bildy, and then the stray was dropped as no hub: the
+    """At the seeds. "Does zobly sync work offline?" names zobly, a hub,
+    and "zobly sync", a stray entity of one memory. At ce2b49f the longer
+    stray name dropped zobly, and then the stray was dropped as no hub: the
     question named nothing, the text ranking was judged, and the answer,
-    which shares only "bildy" with the question, was not among its first
+    which shares only "zobly" with the question, was not among its first
     20."""
-    store, bildy, answer = _a_stray_name_holds_a_hub(stores)
-    _the_hub_is_searched(store, bildy, answer)
+    store, zobly, answer = _a_stray_name_holds_a_hub(stores)
+    _the_hub_is_searched(store, zobly, answer)
 
 
 def test_the_seeds_are_the_longest_names_among_the_hubs(stores):
-    """Stage 1: of the names the question holds, the hub bildy and the stray
-    "bildy sync", the hubs are kept first and the longest name is chosen
-    among them, so bildy seeds the search. The longest over every name found
+    """Stage 1: of the names the question holds, the hub zobly and the stray
+    "zobly sync", the hubs are kept first and the longest name is chosen
+    among them, so zobly seeds the search. The longest over every name found
     is the stray's, which is no hub."""
-    store, bildy, _ = _a_stray_name_holds_a_hub(stores)
+    store, zobly, _ = _a_stray_name_holds_a_hub(stores)
     scope = Scope(user_id=USER)
-    assert store._seeds(SYNC_QUESTION, scope) == ([bildy.id], False)
+    assert store._seeds(SYNC_QUESTION, scope) == ([zobly.id], False)
     longest = detect_query_entities(store.backend, scope, SYNC_QUESTION, longest=True)
     assert longest and not any(store._is_hub(e) for e in longest)
 
@@ -501,8 +501,7 @@ def test_the_seeds_are_the_longest_names_among_the_hubs(stores):
 # judged. At ce2b49f they were applied after the linked search, which had
 # already judged its first 20: the judge read memories the date window then
 # dropped, and none of those the search returned. The re-rank of the other
-# route ran after the filter. No registry row covers it; it is the route
-# difference the audit found.
+# route ran after the filter. It is the route difference the audit found.
 PARK_QUESTION = "Where did Harlow park the car?"
 PARK_ANSWER = "Harlow left the car at the Nordpark lot on Tuesday"
 STREETS = ["Linden", "Birch", "Mill", "Canal", "Market", "Church", "Station", "Bridge",
@@ -572,9 +571,9 @@ def test_every_candidate_is_inside_the_date_window_before_it_is_ordered(stores):
 # ``categories`` and ``entity_id`` turned the linked search off and fetched
 # only ``limit`` candidates: the judge (``_rerank``) read ``limit`` memories,
 # and there was no second call and no member past the limit (only
-# ``_judge_ranking`` marked members). R-26 and R-39 say one call reads 20 "on
-# every search, linked or not"; R-82 and R-97 that a set question returns
-# every member. Both held only unfiltered.
+# ``_judge_ranking`` marked members). One call reads 20 "on every search,
+# linked or not", and a set question returns every member: both held only
+# unfiltered.
 GROCERY_QUESTION = "How much did I spend on groceries?"
 SHOPS = ["Lidl", "Aldi", "Rewe", "Edeka", "Penny", "Netto", "Kaufland", "Spar"]
 
@@ -622,7 +621,7 @@ def test_a_set_question_returns_every_member_unfiltered(stores):
 # mention was written first (``max`` over ``entities_of_memories``, ``ORDER BY
 # em.created_at, em.id``): two entities reached as strongly (two projects a
 # person works on, each at ``LINKED_RELATION``) were told apart by write
-# order. 3623c71 broke every ranked read's tie by id (R-121); its test writes
+# order. 3623c71 broke every ranked read's tie by id; its test writes
 # mentions with fixed ids at one time, so this one never differs there.
 def _two_projects(stores, *, helios_first):
     store = stores(_SenseEmbedder(names=["Ada", "Helios", "Orion"]))
@@ -676,8 +675,8 @@ def test_the_entity_read_as_it_is_the_one_reached_most_strongly_a_tie_by_id(stor
 
 
 # ============================================ rules that hold, tested where they decide
-# R-78 / OF1. "Where do I live?" names nobody; the owner seeds the linked
-# search (``MemoryStore._seeds``). Its test (TG
+# "Where do I live?" names nobody; the owner seeds the linked
+# search (``MemoryStore._seeds``). Its test (test_graph_retrieval.py
 # ``test_a_question_in_the_first_person_is_about_the_owner``) reads the
 # "about" signal in a store of 13 memories. Here the owner's answer is not
 # in the first 20 of the text ranking, which 30 friends' homes fill.
@@ -734,10 +733,11 @@ def test_a_first_person_question_starts_at_the_owner_at_scale_fails_without_the_
     assert answer.id not in _ids(results)
 
 
-# R-1 / R-58 / R-73 / R-10. The multi-hop answer ("Helios uses Postgres in
+# The multi-hop answer ("Helios uses Postgres in
 # production" for "What tools does Ada use for her work?") reaches the
 # linked search only as one of the ``FAMILY_TOP`` of Helios's memories that
-# best state the property asked (``MemoryStore._linked_order``). Its tests (TG
+# best state the property asked (``MemoryStore._linked_order``). Its tests
+# (test_graph_retrieval.py
 # ``test_multi_hop_answer_is_recovered``, ``test_multi_hop_works_at_the_
 # default_depth``) use 53 memories, all inside the text ranking's 80, so the
 # family pick never decided there.
@@ -797,7 +797,7 @@ def test_a_projects_answer_joins_the_pool_by_what_it_says_at_scale_fails_without
     assert answer.id not in _ids(results)
 
 
-# ================================================================== R-128
+# ========================================= a word of one name seeds a search
 # A question names an entity by one word of a longer name: "Arvel" for the
 # place stored as "Mount Arvel". The word seeds the search when it is a word
 # of that entity's names alone and the store uses it for that entity more
@@ -816,7 +816,7 @@ def _a_place_named_by_a_word(stores):
     one other memory. One memory matches more of the question's words than
     the answer does ("When Harlow has nothing to do, Harlow does yoga at
     home"), and the store holds no turns that would weigh those words down
-    (R-129): it takes the keyword place. 30 notes name nobody: 73 memories.
+    (below): it takes the keyword place. 30 notes name nobody: 73 memories.
     A name's words weigh twice a word in the vectors: an embedder follows a
     rare name."""
     store = stores(_SenseEmbedder(names=["Harlow", "Mount Arvel"], name_weight=2.0))
@@ -841,7 +841,7 @@ def _yoga_on_arvel(store, answer):
 
 
 def test_a_word_of_one_name_seeds_the_search_at_scale(stores):
-    """R-128. "Arvel" is a word of Mount Arvel's name alone, and both memories
+    """Here "Arvel" is a word of Mount Arvel's name alone, and both memories
     that say it are Mount Arvel's: it seeds the search beside Harlow. Naming
     two hubs, the question is read as written, the answer meets it on both
     names, and judged, it comes first. It failed at fe094fc."""
@@ -912,18 +912,18 @@ def test_a_word_one_name_holds_that_the_store_says_of_other_things_seeds_nothing
     assert store._seeds("When did Harlow do yoga in the studio?", scope) == ([harlow.id], False)
 
 
-# ================================================================== R-129
+# ========================================= words weighed by what was said
 # The keyword search weighs each word of the question by how rare it is in
 # everything the store holds: its memories and the turns they were said in
 # (``LocalBackend.keyword_search``). At fe094fc it weighed a word by the
 # memories alone. In a store of third-person facts "did" and "we" are rare
 # there and common in what was said, and the one keyword match a search keeps
-# in its judged pool (R-21) went to a memory that shares only those words.
+# in its judged pool went to a memory that shares only those words.
 PAID_QUESTION = "Did we pay invoice 2024-117?"
 
 
 def _invoices_and_turns(stores, *, turns=True):
-    """R-21's 66 invoices and bills (``_invoices``), and one memory more that
+    """The 66 invoices and bills of ``_invoices``, and one memory more that
     says "we did": "We did the quarterly tax filing with the accountant".
     With ``turns``, each memory rests on the turn it was said in, in the
     first person ("Did we pay invoice 2024-201? We did, by card."): 67
@@ -960,7 +960,7 @@ def _paid(store, answer):
 
 
 def test_the_keyword_place_weighs_words_by_what_was_said_at_scale(stores):
-    """R-129. "did" and "we" are in one memory and in most turns; the
+    """Here "did" and "we" are in one memory and in most turns; the
     identifier is in one memory and one turn. Weighed over both, the answer
     is the keyword search's best match, keeps its place among the 20 judged,
     and comes first. It failed at fe094fc."""

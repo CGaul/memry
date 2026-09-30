@@ -65,8 +65,7 @@ that is a new, reviewed architecture decision with a migration plan. It is not a
 alternative backend.
 
 Decision provenance: the PostgreSQL path first entered the original Git history in commit
-`162b4eee3652752f70b301e7a330aa18b701492a` on 2026-07-17. The commit was authored by
-Cosmin Novac and carries `Co-Authored-By: Claude Fable 5`; its stated reason was the generic
+`162b4eee3652752f70b301e7a330aa18b701492a` on 2026-07-17. Its stated reason was the generic
 phrase "multi-writer deployments." The repository contained no named customer, deployment,
 load target, or product requirement that needed that topology. A later history rewrite
 folded the change into root commit `6e74c9c902f1198ef135777b3f642d74d2519e68`. The
@@ -195,9 +194,7 @@ merges asks the tag question and covers tags only. The map is the entity map: ta
 of its types, off at first (the choice kept per browser with the other types), drawn as
 the nodes of their topic entities and linked by co-mentions like any node; the planet and
 part rules stay for named things. `GET /api/v1/map?kind=any` reads them, and `kind=named`,
-the default, reads none. On a sample store of 4,000 memories, 399 tags and 800 named things
-the map took a median of 257 ms before this change (with the old tag graph, which is gone),
-191 ms after without tags and 307 ms with them. The memory list has one About filter over
+the default, reads none. The memory list has one About filter over
 every entity with a memory, grouped by type: a tag picked goes to `categories`, which
 reaches the tags under a broader one, and anything else to `entity_id`, as the two filters
 did before. Several picks of one kind match any of them, and a tag with a person or thing
@@ -223,8 +220,8 @@ link from a memory to an entity and keeps the observed surface text.
 The set is `person`, `organization`, `project`, `product`, `place`, `event`, `document`,
 `code`, `concept`, `other`. `document` and `code` were added after auditing what a real
 store had dumped into `other`: on one side contracts, invoices, certificates and
-registration numbers (`HRB 110232`, `TÜV Kaufvertrag`), on the other files, symbols,
-tables and config keys (`lib/sync.ts`, `canUserSync`, `BILDY_AWS_S3_BUCKET`). Both are
+registration numbers (`HRB 123456`, `TÜV Kaufvertrag`), on the other files, symbols,
+tables and config keys (`lib/export.ts`, `canUserExport`, `REPORTS_S3_BUCKET`). Both are
 large, coherent groups in ordinary use.
 
 **The type does not affect search ranking.** Nothing in retrieval reads it: hybrid scoring
@@ -280,17 +277,17 @@ Where it happens (`src/memry/intelligence/identity.py`, `entities.py`, `store.py
    is compared with the new memory.
    A name the store already has joins the entity of that name with the highest P(same),
    unless the judge says "different" at 0.5 or more; the merge bar does not apply. (Held
-   to it, 88 of 431 mentions of a known name became one-memory entities in a replayed
-   store, and those never reached step 3.) For a name written another way, the first
+   to it, mentions of a known name became one-memory entities that never reached step
+   3.) For a name written another way, the first
    "merge" wins. Otherwise a new entity is made and each waiting pair is recorded as a
    proposal (a kept-apart pair is recorded too). When the judge cannot answer (an
    outage), the pair waits at step 0 and the weekly pass compares it again.
 3. **The comparison (`compare`).** The judge (Jev) gets both entries side by side, in
-   both orders, and the answers are averaged: asked in one order, the merge bars moved
-   between runs. The check of a name the store already has is the exception: it is asked
-   once, with the entity first and the new memory second, because it reads no merge bar,
-   only P(different) at 0.5, which candidate is likelier, and the belongs bar. That halves
-   the calls of most saves, and in two runs it decided as well as both orders. Each side
+   both orders, and the answers are averaged, so the answer does not depend on which
+   entry came first. The check of a name the store already has is the exception: it is
+   asked once, with the entity first and the new memory second, because it reads no merge
+   bar, only P(different) at 0.5, which candidate is likelier, and the belongs bar. That
+   halves the calls of most saves. Each side
    shows its name, type, description (if one has been built), whether it is the store owner, and up to 10
    memories (50 at the last step): the most recent 30% and the rest closest in embedding
    to the other side's. A memory naming both entries is left out of both sides. Every
@@ -318,11 +315,10 @@ Where it happens (`src/memry/intelligence/identity.py`, `entities.py`, `store.py
    skipped (counted as done) when there is nothing to add. It uses the first step's bar
    until it is measured on its own.
    **Choosing among namesakes.** No answer about a first name reaches the merge bar, but
-   the rest of a conversation tells namesakes apart (on 40 generated cases the right
-   person scored higher in 37 instead of 34). So in the weekly pass, a name with fewer
-   than 3 memories and open pairs to two or more entities, all asked at step 2, joins
-   the likeliest when it leads the next by 0.10 and has P(same) of at least 0.5
-   (`choose_among_candidates`; 29 right and 1 wrong on those cases). Only candidates the
+   the rest of a conversation helps tell namesakes apart. So in the weekly pass, a name
+   with fewer than 3 memories and open pairs to two or more entities, all asked at step
+   2, joins the likeliest when it leads the next by 0.10 and has P(same) of at least 0.5
+   (`choose_among_candidates`). Only candidates the
    judge has not ruled out (P(different) under 0.5, stored on each pair) count: with one
    candidate left it keeps waiting, since it may be a third person. It asks the judge
    nothing.
@@ -404,11 +400,8 @@ question through the same function: its last pass, when at most 20 tags are left
 nothing else flagged, hands `judged_tag_merges` every pair of them and only suggests the
 groups that reach 0.55. It neither reads nor writes the pass's record of compared pairs,
 so a click never keeps the weekly pass from comparing a pair of its own. No tag question is
-asked on the names alone: judged on their names, "memry" read as a typo of "memory" (0.98).
-
-The measurements behind these numbers are in the PhD repository,
-`papers/memry-field-studies/findings/identity-obvious-merges.md` and
-`identity-threshold-by-evidence.md`.
+asked on the names alone: judged on their names only, a tag such as "memry" reads as a typo
+of "memory".
 
 Each entity has two derived profile fields only:
 
@@ -511,9 +504,8 @@ RAM." Status is visible on MCP memory rows and in aggregate statistics.
      reads both facts as Memry shows any memory to a model, with the date each was said and
      the date it happened where that is known, and is told to write every time as the date
      or period it names, reading "last year" or "yesterday" against the day its own text
-     was said, and to keep each date with its own event. Without the dates, "a road trip
-     last year", said in April, was merged beside a trip of the December before as "the
-     previous year's road trip", and read as a year too early. The writer may also answer
+     was said, and to keep each date with its own event. Without the dates, a relative time
+     in one fact can be read against the other fact's day. The writer may also answer
      that the new fact is about another event or thing of the same kind (another trip,
      another game, another deal): then nothing is merged and the fact is added as NEW. The
      decision provider's MORE on such a pair is often as confident as on a real added
@@ -603,9 +595,9 @@ entity or date filter, whether its question names anything, and with `relational
    phrase that is only an alias through the same table, so neither lookup reads every name
    the store has, nor another account's. Only hubs are kept: a stray phrase stored as an
    entity does not decide what a search is about. The longest-name rule then runs among
-   the hubs: "bildy v4" and not also "bildy", since a search from bildy reaches every
+   the hubs: "zobly v4" and not also "zobly", since a search from zobly reaches every
    version below it. Because the hubs are kept first, a stray entity whose name holds a
-   hub's ("bildy sync", one memory, no type) does not hide the hub. A question naming no
+   hub's ("zobly sync", one memory, no type) does not hide the hub. A question naming no
    hub that speaks in the first person ("Where do I live?") is about the store's owner,
    when the owner is a hub.
 2. **Candidates**, as deep for every search (eight per result asked for, at least 40 and
@@ -680,11 +672,8 @@ entity or date filter, whether its question names anything, and with `relational
    one property), so on "Show everything about it" aboutness alone orders the list. A tie
    keeps the order judged, whose ties go by memory id; the
    memories not judged follow in their order. A search not judged keeps its order. A
-   question naming no hub was once ordered by a blend of the judged score and the text
-   ranking's position, because the judgement alone measured worse in the wording the
-   re-rank then asked in; measured again on `distractors_v1` in the one wording every
-   search now asks in, the judgement alone put an answer first on every question, as well
-   as any blend did, and the blend was removed (R-117). A memory kept as history then
+   question naming no hub is ordered by the judgement alone too, with no blend of the
+   judged score and the text ranking's position. A memory kept as history then
    comes right after the memory in use that replaced it (below), and the results are cut
    to the limit.
 
@@ -741,7 +730,7 @@ just before it, so for one question the current value comes first and a question
 past keeps its answer where it ranked. It is rendered with the date it was said and
 "[until <date>]" (context reconstruction, above), its source turns are shown as its
 evidence under the same rules as any memory's (stage 7), and MCP rows carry its
-`invalid_at`. Hiding them lost LoCoMo questions about the past. Deleting one forgets it as
+`invalid_at`. Hiding them would lose the answers to questions about the past. Deleting one forgets it as
 deleting a memory in use does: it no longer records what replaced it, search reads it no
 more, and it is listed as forgotten, where it can be brought back or purged. A memory
 superseded otherwise (a contradiction, a consolidation, a distillation) or deleted is

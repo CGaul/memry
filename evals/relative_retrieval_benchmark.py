@@ -1231,7 +1231,8 @@ def tag_world(world: dict, seed: int = 21) -> None:
 def build_store(world: dict, embedder: Embedder, links: str, answers: dict, seed: int = 3,
                 decider=None, property_dimensions: int | None = None,
                 says: dict[str, str] | None = None, vectors: str = "property",
-                questions: dict[str, list[str]] | None = None):
+                questions: dict[str, list[str]] | None = None,
+                confidence: list[tuple[int, str]] | None = None):
     """The world in a fresh store, with compared pairs as ``links`` says.
     ``decider`` is the decision provider searches ask when given (Jev in
     production).
@@ -1245,7 +1246,10 @@ def build_store(world: dict, embedder: Embedder, links: str, answers: dict, seed
     keeps of every vector it reads. ``questions`` (memory index as a string:
     the questions that memory answers) are stored as each memory's question
     keys, as a backfill stores them, and turn ``retrieval.question_keys``
-    on."""
+    on. ``confidence`` (one (confirmations, confirmed_at) per relation of the
+    world) is each relation's confidence as Memry counts it
+    (``retrieval.link_confidence``); without it, each is said once, when the
+    row was stored."""
     if vectors not in ("property", "ordinary"):
         raise ValueError(f"vectors must be 'property' or 'ordinary', not {vectors!r}")
     if vectors == "ordinary" and says is not None:
@@ -1278,9 +1282,11 @@ def build_store(world: dict, embedder: Embedder, links: str, answers: dict, seed
                 id=f"{memory.id}.{k}", entity_id=ids[name], memory_id=memory.id,
                 surface=name, created_at=stamp))
     for n, (subject, predicate, obj) in enumerate(world["relations"]):
+        said = {} if confidence is None else {
+            "confirmations": confidence[n][0], "confirmed_at": confidence[n][1]}
         store.backend.add_relation(Relation(
             id=f"r{n:05d}", subject=ids[subject], predicate=predicate, object=ids[obj],
-            user_id=USER, created_at=stamp))
+            user_id=USER, created_at=stamp, **said))
     rnd = random.Random(seed)
     for n, (child, parent, kind) in enumerate(world["pairs"] if links != "none" else []):
         if links == "oracle":
@@ -1306,6 +1312,56 @@ def build_store(world: dict, embedder: Embedder, links: str, answers: dict, seed
         # to (at the links just stored) read "it"
         store.refresh_property_vectors(user_id=USER)
     return store, memory_ids
+
+
+STALE_DAYS = 400
+
+
+def add_stale_relations(world: dict, seed: int) -> set[int]:
+    """One false "works_on" per person but the owner: a project they do not
+    work on, drawn with ``seed``, stored as a relation with no memory (as one
+    whose memory is long out of date would be). Returns their indexes in
+    ``world["relations"]``."""
+    rnd = random.Random(seed)
+    projects = sorted(n for n, t in world["types"].items() if t == "project")
+    works = defaultdict(set)
+    for s, p, o in world["relations"]:
+        if p == "works_on":
+            works[s].add(o)
+    stale = set()
+    for who in sorted(n for n, t in world["types"].items() if t == "person" and n != OWNER):
+        if not works[who]:
+            continue
+        stale.add(len(world["relations"]))
+        world["relations"].append(
+            (who, "works_on", rnd.choice([p for p in projects if p not in works[who]])))
+    return stale
+
+
+def relation_confirmations(world: dict, spec: str, age_days: float,
+                           stale: set[int] = frozenset()) -> list[tuple[int, str]]:
+    """(confirmations, last confirmed) for each relation of ``world``.
+    "world": the memories that name both ends, as a save counts them (each
+    one containing the relation adds one). "random:SEED": 1, 2, 3 or 5, drawn
+    at random, to see how far the order moves when the counts differ. The
+    last confirmation is ``age_days`` before now; for the ``stale``
+    relations (``add_stale_relations``), ``STALE_DAYS`` before, said once."""
+    from datetime import datetime, timedelta, timezone
+
+    def ago(days: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+    at = ago(age_days)
+    if spec == "world":
+        counts = [max(1, sum(1 for m in world["memories"]
+                             if s in m["entities"] and o in m["entities"]))
+                  for s, _, o in world["relations"]]
+    elif spec.startswith("random:"):
+        rnd = random.Random(int(spec.split(":", 1)[1]))
+        counts = [rnd.choice([1, 2, 3, 5]) for _ in world["relations"]]
+    else:
+        raise ValueError(f"--confirmations is 'world' or 'random:SEED', not {spec!r}")
+    return [(1, ago(STALE_DAYS)) if k in stale else (n, at) for k, n in enumerate(counts)]
 
 
 def store_says(store: MemoryStore, memory_ids: list[str], texts: list[str],
@@ -1651,6 +1707,21 @@ def main() -> None:
                         help="what the linked search compares the question with: each "
                              "memory's property vector (the names it is about read \"it\"), "
                              "or its ordinary vector, names as written")
+    parser.add_argument("--link-confidence", action="store_true",
+                        help="retrieval.link_confidence on: each relation counts by its "
+                             "confirmations and their age (graph_retrieval.relation_confidence)")
+    parser.add_argument("--confirmations", default="world", metavar="SPEC",
+                        help="with --link-confidence, each relation's confirmations: 'world' "
+                             "(the memories naming both ends, as a save counts them) or "
+                             "'random:SEED' (1, 2, 3 or 5 at random, a sensitivity test)")
+    parser.add_argument("--relation-age", type=float, default=0.0, metavar="DAYS",
+                        help="with --link-confidence, the days since every relation's last "
+                             "confirmation (the world has no time of its own: 0 by default)")
+    parser.add_argument("--stale-relations", type=int, default=None, metavar="SEED",
+                        help="add to the world one false 'works_on' per person (a project "
+                             "they do not work on, drawn with SEED), stored without a memory "
+                             "and, with --link-confidence, last confirmed 400 days ago: a "
+                             "scripted test of the time decay")
     parser.add_argument("--property-dimensions", type=int, default=None,
                         help="keep this many leading numbers of every vector the linked "
                              "search compares (retrieval.property_dimensions; all by default)")
@@ -1715,6 +1786,7 @@ def main() -> None:
                  else build_world(size))
         if args.tags:
             tag_world(world)
+        stale = add_stale_relations(world, args.stale_relations) if args.stale_relations else set()
         texts = [m["text"] for m in world["memories"]]
         questions: dict[str, list[str]] | None = None
         if args.write_questions:
@@ -1771,10 +1843,14 @@ def main() -> None:
         for links in args.links:
             if args.jev:
                 decider = jev_judge()
+            confidence = (relation_confirmations(world, args.confirmations, args.relation_age,
+                                                 stale=stale)
+                          if args.link_confidence else None)
             store, memory_ids = build_store(world, embedder, links, answers, decider=decider,
                                             says=says, vectors=args.vectors,
                                             property_dimensions=args.property_dimensions,
-                                            questions=questions)
+                                            questions=questions, confidence=confidence)
+            store.config.retrieval.link_confidence = args.link_confidence
             # with question keys, each mode twice: the search reading them and not
             arms = [None] if questions is None else [True, False]
             for mode, keys in [(mode, keys) for mode in modes for keys in arms]:

@@ -645,6 +645,16 @@ class MemoryBackend(ABC):
     def list_relations(self, scope: Scope, *, limit: int = 1000) -> list[Relation]:
         return []
 
+    def confirm_relations(self, memory_id: str, at: str) -> int:
+        """Confirm once more, at ``at``, the active relations between two
+        entities this memory mentions (a turn restated it)."""
+        return 0
+
+    def contradict_relations(self, memory_id: str) -> int:
+        """Count a contradiction on the active relations between two entities
+        this memory mentions (a newer memory contradicts it)."""
+        return 0
+
     def relations_of(self, entity_ids: list[str]) -> list[Relation]:
         """Active relations touching any of these entities (either endpoint)."""
         return []

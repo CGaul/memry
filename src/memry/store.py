@@ -1181,6 +1181,13 @@ class MemoryStore:
             actions.append(action)
             if action.conflicts_with and action.memory_id:
                 self._queue_conflict(scope.user_id, action)
+                # the old memory is contradicted and kept: its relations
+                # count one contradiction more (``Relation.contradictions``)
+                self.backend.contradict_relations(action.conflicts_with)
+            if action.event in ("NONE", "UPDATE") and action.memory_id:
+                # a person said a stored memory again: its relations are
+                # confirmed once more (``Relation.confirmations``)
+                self.backend.confirm_relations(action.memory_id, created_at or utcnow())
             if action.event != "NONE" and action.memory_id:
                 excluded.add(action.memory_id)
             # Entity mentions attach to the memory the action landed on
@@ -1201,7 +1208,8 @@ class MemoryStore:
                     owner=self._owner_for(scope, candidate.entities, messages),
                 )
                 self._resolve_relations(
-                    candidate.relations, resolved, scope, action.memory_id
+                    candidate.relations, resolved, scope, action.memory_id,
+                    said_at=created_at,
                 )
                 self._recheck_proposals(
                     scope, open_before, {entity.id for entity in resolved.values()}
@@ -1453,10 +1461,14 @@ class MemoryStore:
         resolved: dict[str, Any],
         scope: Scope,
         memory_id: str,
+        *,
+        said_at: str | None = None,
     ) -> None:
         """Turn (subject, predicate, object) surface triples into typed edges
         between the entities they linked to. Both endpoints must have resolved
-        to real entities in this same memory, so an edge is always grounded."""
+        to real entities in this same memory, so an edge is always grounded.
+        An edge already stored is confirmed once more, at ``said_at`` (the
+        save's time; now when None)."""
         for rel in relations:
             subj = resolved.get(str(rel.get("subject", "")).strip().lower())
             obj = resolved.get(str(rel.get("object", "")).strip().lower())
@@ -1470,6 +1482,7 @@ class MemoryStore:
                     object=obj.id,
                     user_id=scope.user_id,
                     memory_id=memory_id,
+                    confirmed_at=said_at or utcnow(),
                 )
             )
 
@@ -2456,7 +2469,9 @@ class MemoryStore:
         ``plan``."""
         cfg = self.config.retrieval
         seeds = plan.seeds
-        act, above = activation_paths(self.backend, seeds, depth=cfg.relational_depth)
+        # with link confidence on, each relation weighs by its confidence now
+        more = {"confidence_at": utcnow()} if cfg.link_confidence else {}
+        act, above = activation_paths(self.backend, seeds, depth=cfg.relational_depth, **more)
         # With several hubs named, "it" could stand for any of them: masked,
         # "Why do Ada and Kai find Mira inspiring?" reads "Why do it and it
         # find it inspiring?", which says nothing about which of their
@@ -4450,7 +4465,11 @@ class MemoryStore:
                 self.backend.add_relation(Relation(
                     subject=relation.subject, predicate=relation.predicate,
                     object=relation.object, user_id=relation.user_id, memory_id=ids[home],
-                    created_at=now, valid_from=relation.valid_from))
+                    created_at=now, valid_from=relation.valid_from,
+                    # a split adds no confirmation: the counts carry over
+                    confirmations=relation.confirmations,
+                    confirmed_at=relation.confirmed_at or relation.created_at,
+                    contradictions=relation.contradictions))
             for part in parts:
                 self.backend.add_event(MemoryEvent(
                     memory_id=part.id, event="ADD", new_content=part.content,

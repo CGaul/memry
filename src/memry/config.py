@@ -182,6 +182,12 @@ class RetrievalConfig(BaseModel):
     #: Memry's facts; ``memry backfill-questions`` writes them for a store
     #: saved before.
     question_keys: bool = False
+    #: Link confidence: each relation counts in the linked search by its
+    #: confirmations (how many memories and repeated turns contain it, how
+    #: long ago the last was saved, how many contradictions were kept beside
+    #: one; ``graph_retrieval.relation_confidence``). Off: every relation
+    #: counts the same. Off until measured (PhD notes, link-confidence).
+    link_confidence: bool = False
     #: A question that needs several memories (a list, a total, a comparison)
     #: has at most this many more judged in one further call, after the first
     #: ``decision.rerank_pool``: the memories filed under the topics the first

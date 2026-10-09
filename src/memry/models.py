@@ -477,6 +477,14 @@ class Relation(BaseModel):
     created_at: str = Field(default_factory=utcnow)
     valid_from: str = Field(default_factory=utcnow)
     invalid_at: str | None = None
+    #: Its confirmations (``graph_retrieval.relation_confidence``, read only
+    #: with ``retrieval.link_confidence``): how many memories and repeated
+    #: turns contain it, when the last of them was saved (None: when the row
+    #: was created), and how many contradictions were kept beside a memory
+    #: that contains it.
+    confirmations: int = 1
+    confirmed_at: str | None = None
+    contradictions: int = 0
 
 
 class ContextResult(BaseModel):

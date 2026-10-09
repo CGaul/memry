@@ -305,7 +305,10 @@ CREATE TABLE IF NOT EXISTS relations (
     memory_id  TEXT,
     created_at TEXT NOT NULL,
     valid_from TEXT NOT NULL,
-    invalid_at TEXT
+    invalid_at TEXT,
+    confirmations  INTEGER NOT NULL DEFAULT 1,
+    confirmed_at   TEXT DEFAULT NULL,
+    contradictions INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
 CREATE INDEX IF NOT EXISTS idx_relations_object ON relations(object);
@@ -868,6 +871,16 @@ class LocalBackend(MemoryBackend):
             self._db.execute("ALTER TABLE entity_mentions ADD COLUMN decided TEXT")
         if "entity_type" not in mention_columns:
             self._db.execute("ALTER TABLE entity_mentions ADD COLUMN entity_type TEXT")
+        relation_columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(relations)").fetchall()
+        }
+        # how well each relation is confirmed (``Relation.confirmations``);
+        # a store from before counts each relation said once
+        for column, kind in (("confirmations", "INTEGER NOT NULL DEFAULT 1"),
+                             ("confirmed_at", "TEXT DEFAULT NULL"),
+                             ("contradictions", "INTEGER NOT NULL DEFAULT 0")):
+            if column not in relation_columns:
+                self._db.execute(f"ALTER TABLE relations ADD COLUMN {column} {kind}")
         if "kind" not in event_columns:
             # what took a memory out of use (``MemoryEvent.kind``); older rows
             # keep NULL and are read by their reason. The default lets a backup
@@ -2953,28 +2966,73 @@ class LocalBackend(MemoryBackend):
             id=row["id"], subject=row["subject"], predicate=row["predicate"],
             object=row["object"], user_id=row["user_id"], memory_id=row["memory_id"],
             created_at=row["created_at"], valid_from=row["valid_from"],
-            invalid_at=row["invalid_at"],
+            invalid_at=row["invalid_at"], confirmations=row["confirmations"],
+            confirmed_at=row["confirmed_at"], contradictions=row["contradictions"],
         )
 
     def add_relation(self, relation: Relation) -> Relation:
         with self._lock:
             # dedupe: one active edge per (subject, predicate, object, namespace)
             existing = self._db.execute(
-                "SELECT id FROM relations WHERE subject=? AND predicate=? AND object=? "
+                "SELECT id, memory_id, confirmed_at, created_at FROM relations "
+                "WHERE subject=? AND predicate=? AND object=? "
                 "AND IFNULL(user_id,'')=IFNULL(?,'') AND invalid_at IS NULL",
                 (relation.subject, relation.predicate, relation.object, relation.user_id),
             ).fetchone()
             if existing:
+                # another memory contains it: one more confirmation, at that save
+                if relation.memory_id is not None and relation.memory_id != existing["memory_id"]:
+                    said = relation.confirmed_at or relation.created_at
+                    last = existing["confirmed_at"] or existing["created_at"]
+                    self._db.execute(
+                        "UPDATE relations SET confirmations = confirmations + 1, "
+                        "confirmed_at = ? WHERE id = ?",
+                        (later_ts(last, said), existing["id"]))
+                    self._commit()
                 return relation
             self._db.execute(
                 "INSERT INTO relations (id, subject, predicate, object, user_id, "
-                "memory_id, created_at, valid_from, invalid_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "memory_id, created_at, valid_from, invalid_at, confirmations, "
+                "confirmed_at, contradictions) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (relation.id, relation.subject, relation.predicate, relation.object,
                  relation.user_id, relation.memory_id, relation.created_at,
-                 relation.valid_from, relation.invalid_at),
+                 relation.valid_from, relation.invalid_at, relation.confirmations,
+                 relation.confirmed_at, relation.contradictions),
             )
             self._commit()
         return relation
+
+    def _relations_stated_by(self, memory_id: str) -> str:
+        """The SQL condition for the active relations of a memory: both ends
+        among the entities it mentions."""
+        return ("invalid_at IS NULL AND subject IN (SELECT entity_id FROM entity_mentions "
+                "WHERE memory_id = :m) AND object IN (SELECT entity_id FROM entity_mentions "
+                "WHERE memory_id = :m)")
+
+    def confirm_relations(self, memory_id: str, at: str) -> int:
+        """A person said this memory again (reconcile's "same" or "more"): each
+        active relation between two entities it mentions is confirmed once
+        more, at ``at``. Returns how many."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE relations SET confirmations = confirmations + 1, confirmed_at = "
+                "CASE WHEN IFNULL(confirmed_at, created_at) > :at "
+                "THEN IFNULL(confirmed_at, created_at) ELSE :at END "
+                f"WHERE {self._relations_stated_by(memory_id)}",
+                {"m": memory_id, "at": at})
+            self._commit()
+        return cur.rowcount
+
+    def contradict_relations(self, memory_id: str) -> int:
+        """A newer memory contradicts this one and is kept beside it: each
+        active relation between two entities it mentions counts one more
+        contradiction. Returns how many."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE relations SET contradictions = contradictions + 1 "
+                f"WHERE {self._relations_stated_by(memory_id)}", {"m": memory_id})
+            self._commit()
+        return cur.rowcount
 
     def list_relations(self, scope: Scope, *, limit: int = 1000) -> list[Relation]:
         clause, params = _scope_clause(_user_scope(scope))

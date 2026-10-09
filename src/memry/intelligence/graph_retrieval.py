@@ -187,6 +187,47 @@ FLOOR = 0.05
 LOW = 0.3
 
 
+#: Link confidence (``retrieval.link_confidence``, off by default): a relation
+#: counts ``LINKED_RELATION`` times ``relation_confidence``. The factor rises
+#: with each memory or repeated turn that contains the relation. It falls with
+#: the time since the last of them and with each contradiction kept beside
+#: one. It stays within ``CONFIDENCE_FLOOR`` and ``CONFIDENCE_CAP``. A
+#: relation said once within ``CONFIDENCE_GRACE_DAYS`` counts 1, today's
+#: weight. At the floor a relation counts ``LOW``, as no link, and its
+#: entity's memories stay candidates. At the cap it counts ``UP_KIND``. See
+#: the PhD notes, link-confidence.
+CONFIDENCE_PER_LOG_COUNT = 0.3
+CONFIDENCE_GRACE_DAYS = 30.0
+CONFIDENCE_HALF_LIFE_DAYS = 180.0
+CONFIDENCE_PER_CONTRADICTION = 0.5
+CONFIDENCE_FLOOR = 0.6
+CONFIDENCE_CAP = 1.6
+
+
+def relation_confidence(
+    confirmations: int, confirmed_at: str | None, contradictions: int, now: str,
+) -> float:
+    """The factor on a relation's weight: (1 + 0.3 ln n) for its n
+    confirmations, halved every 180 days after the first 30 since the last
+    one, halved again for each contradiction, kept within [0.6, 1.6]. An
+    unknown time (``confirmed_at`` None) counts as now."""
+    import math
+    from datetime import datetime
+
+    n = max(int(confirmations or 1), 1)
+    days = 0.0
+    if confirmed_at:
+        try:
+            days = (datetime.fromisoformat(now) - datetime.fromisoformat(confirmed_at)
+                    ).total_seconds() / 86400.0
+        except (TypeError, ValueError):  # an unreadable time counts as now
+            days = 0.0
+    m = (1.0 + CONFIDENCE_PER_LOG_COUNT * math.log(n))
+    m *= 2.0 ** (-max(0.0, days - CONFIDENCE_GRACE_DAYS) / CONFIDENCE_HALF_LIFE_DAYS)
+    m *= CONFIDENCE_PER_CONTRADICTION ** max(int(contradictions or 0), 0)
+    return min(max(m, CONFIDENCE_FLOOR), CONFIDENCE_CAP)
+
+
 @dataclass(frozen=True)
 class Link:
     """One link: for "kind" and "part" ``child`` belongs to ``parent``; for
@@ -198,9 +239,14 @@ class Link:
     p: float
 
 
-def links_of(backend: MemoryBackend, entity_ids: list[str]) -> list[Link]:
+def links_of(
+    backend: MemoryBackend, entity_ids: list[str], *, confidence_at: str | None = None,
+) -> list[Link]:
     """Extracted relations and compared pairs touching these entities, every
     answer with its probability.
+
+    A relation's ``p`` is 1, or with ``confidence_at`` (a time: link
+    confidence is on) its ``relation_confidence`` at that time.
 
     A pair links as "same" only on a calibrated judge's answer, the one that
     stores P(different) beside P(same): a pair nobody judged ("not yet
@@ -219,7 +265,9 @@ def links_of(backend: MemoryBackend, entity_ids: list[str]) -> list[Link]:
             pairs.append((proposal, a, b))
     tags = backend.topic_ids({end for r in relations for end in (r.subject, r.object)}
                              | {end for _, a, b in pairs for end in (a, b)})
-    links = [Link(r.subject, r.object, "relation", 1.0)
+    links = [Link(r.subject, r.object, "relation", 1.0 if confidence_at is None else
+                  relation_confidence(r.confirmations, r.confirmed_at or r.created_at,
+                                      r.contradictions, confidence_at))
              for r in relations if r.subject not in tags and r.object not in tags]
     for proposal, a, b in pairs:
         if a in tags or b in tags:
@@ -257,13 +305,15 @@ def _steps(link: Link, node: str):
 
 def activation_paths(
     backend: MemoryBackend, seeds: list[str], *, depth: int = 1,
+    confidence_at: str | None = None,
 ) -> tuple[dict[str, float], set[str]]:
     """How strongly each entity within ``depth`` links of the seeds bears on a
     query about the seeds (1.0 for a seed, the product of the factors along
     the best path for the rest), and the entities whose best path took a step
     up (the thing or the whole a seed belongs to, and siblings through them):
     what is true of those holds for a seed only where the seed says nothing
-    else."""
+    else. ``confidence_at``: weigh each relation by its confidence at that
+    time (``links_of``)."""
     best: dict[str, float] = {seed: 1.0 for seed in seeds}
     up: set[str] = set()
     # A path is a state as well as a place: whether it has gone up to a thing
@@ -273,7 +323,8 @@ def activation_paths(
     for _ in range(max(depth, 0)):
         if not frontier:
             break
-        links = links_of(backend, sorted({node for node, _ in frontier}))
+        links = links_of(backend, sorted({node for node, _ in frontier}),
+                         confidence_at=confidence_at)
         reached: dict[tuple[str, bool], float] = {}
         for (node, went_up), act in frontier.items():
             for link in links:

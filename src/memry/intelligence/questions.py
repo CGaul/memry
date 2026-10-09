@@ -224,17 +224,19 @@ def write_questions(llm: Any, memories: list[str],
 
 #: Short words frequent in each language and rare in the others: enough to
 #: tell German, English, French and Spanish turns apart without a library.
-#: "in" is in no list, since it is as frequent in German as in English.
-#: "was" is German only here: in a short German question it is often the
-#: only such word ("Was verkauft Brakadu Bakery?").
+#: "in" is in no list, since it is as frequent in German as in English. "an"
+#: and "es" are German only. "was" counts as German as a text's first word
+#: ("Was verkauft Brakadu Bakery?") and as English anywhere else ("Where was
+#: it announced?").
 _STOPWORDS: dict[str, frozenset[str]] = {
-    "en": frozenset("""the and is are were of to that it with for on this you
+    "en": frozenset("""the and is are was were of to that it with for on this you
         have has what where who which when how does did do not but be at from they
-        we my your his her their an or will would can there about""".split()),
-    "de": frozenset("""der die das und ist sind war waren nicht ein eine einen dem den
-        des mit für auf ich du er sie wir ihr was wo wer wann wie welche welcher
-        welches hat haben wird werden zu im auch noch bei aus nach über mein
-        dein sein kein oder aber dass""".split()),
+        we my your his her their or will would can there about""".split()),
+    "de": frozenset("""der die das und ist sind war waren nicht ein eine einen einem
+        dem den des mit für auf ich du er sie wir ihr wo wer wann wie wem wen wessen
+        welche welcher welches welchem welchen woran wofür womit worauf hat haben
+        hatte wird werden wurde wurden zu zum zur vom im am an auch noch bei aus
+        nach über mein dein sein kein oder aber dass gibt es sich""".split()),
     "fr": frozenset("""le la les et est sont était un une des du de que qui dans pour
         pas sur avec ce cette il elle nous vous ils je mon ma mes où quel quelle
         quand comment aussi mais ou au aux""".split()),
@@ -253,6 +255,9 @@ def detect_language(text: str) -> str | None:
     if not words:
         return None
     counts = {code: sum(w in stop for w in words) for code, stop in _STOPWORDS.items()}
+    if words[0] == "was":  # the German question word, not English "was"
+        counts["en"] -= 1
+        counts["de"] += 1
     best = max(counts.values())
     if best == 0:
         return None

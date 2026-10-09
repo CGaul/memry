@@ -101,6 +101,9 @@ def test_language_names_are_named_once_and_at_most_three():
     ("Welche Plattformen unterstützt Brakadu planner v2?", "de"),
     ("Où habite Ada ? Elle est à Amsterdam avec sa sœur.", "fr"),
     ("¿Dónde vive Ada? Ella está en Amsterdam con su hermana.", "es"),
+    ("Where was Brakadu planner v1 announced?", "en"),
+    ("In welchem Jahr wurde Brakadu Bakery gegründet?", "de"),
+    ("An welchem Wochentag trifft sich das Team von Gilduis ledger?", "de"),
     ("Brakadu planner v3", None),
     ("", None),
 ])

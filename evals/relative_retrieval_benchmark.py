@@ -148,6 +148,18 @@ class CachedEmbedder(Embedder):
         return [self.cache[t] for t in texts]
 
 
+class CacheOnly(Embedder):
+    """Stands in for the OpenAI embedder of the cache file
+    (``memry_relative_openai.json``) where only the cache may answer
+    (``--cache-only``): the run stops at a text the cache lacks, before any call."""
+
+    name, _model, dimensions = "openai", "text-embedding-3-small", 1536
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise SystemExit(f"--cache-only: {len(texts)} texts are not in the embedding cache; "
+                         "nothing was embedded")
+
+
 def words(n: int, rnd: random.Random) -> list[str]:
     out: set[str] = set()
     while len(out) < n:
@@ -1654,6 +1666,9 @@ def main() -> None:
     parser.add_argument("--property-dimensions", type=int, default=None,
                         help="keep this many leading numbers of every vector the linked "
                              "search compares (retrieval.property_dimensions; all by default)")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="read every vector from the OpenAI embedding cache and stop, "
+                             "embedding nothing, at the first text it lacks")
     args = parser.parse_args()
     if args.says and args.vectors == "ordinary":
         parser.error("--says gives property vectors: it cannot go with --vectors ordinary")
@@ -1687,7 +1702,10 @@ def main() -> None:
         judge.decide = counted
         return judge
     key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if key:
+    if args.cache_only:
+        base = CacheOnly()
+        sizes = args.sizes or [2000, 10000]
+    elif key:
         base: Embedder = OpenAIEmbedder(EmbeddingConfig(provider="openai", api_key=key))
         sizes = args.sizes or [2000, 10000]
     else:

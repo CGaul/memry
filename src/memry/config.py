@@ -70,6 +70,15 @@ class LLMConfig(BaseModel):
         return self.model or DEFAULT_LLM_MODELS.get(self.provider, "")
 
 
+def _rank(name: str, default: Any) -> Any:
+    """An experiment's value for a text ranking constant: ``MEMRY_RANK_<NAME>``
+    from the environment, read once when this module is imported, else
+    ``default`` (PhD notes, text-ranking-constants-plan). Nothing changes when
+    nothing is set."""
+    raw = os.environ.get(f"MEMRY_RANK_{name}", "").strip()
+    return type(default)(raw) if raw else default
+
+
 class DecisionConfig(BaseModel):
     """Provider for Memry's decision questions: entity identity, name screening,
     reconciliation, durability, dates and re-ranking.
@@ -107,7 +116,7 @@ class DecisionConfig(BaseModel):
     rerank: bool | None = None
     #: How many of the first candidates to judge: the first of the linked
     #: order with seeds, of the text ranking without (``MemoryStore.search``).
-    rerank_pool: int = 20
+    rerank_pool: int = _rank("RERANK_POOL", 20)
 
 
 class EmbeddingConfig(BaseModel):
@@ -134,12 +143,12 @@ class RetrievalConfig(BaseModel):
     # an assignment is validated too, so a removed mode cannot be set later
     model_config = ConfigDict(validate_assignment=True)
 
-    rrf_k: int = 60
-    vector_weight: float = 1.0
-    keyword_weight: float = 1.0
+    rrf_k: int = _rank("RRF_K", 60)
+    vector_weight: float = _rank("VECTOR_WEIGHT", 1.0)
+    keyword_weight: float = _rank("KEYWORD_WEIGHT", 1.0)
     fused_weight: float = 0.70
-    recency_weight: float = 0.15
-    importance_weight: float = 0.15
+    recency_weight: float = _rank("RECENCY_WEIGHT", 0.15)
+    importance_weight: float = _rank("IMPORTANCE_WEIGHT", 0.15)
     recency_half_life_days: float = 30.0
     candidate_multiplier: int = 3
     reconcile_similarity_limit: int = 5
@@ -193,7 +202,7 @@ class RetrievalConfig(BaseModel):
     #: best match the query, up to this many tokens in all
     #: (``MemoryStore.evidence``); 0 shows none. A memory is a summary, and the
     #: turn it came from keeps what the summary left out.
-    evidence_tokens: int = 600
+    evidence_tokens: int = _rank("EVIDENCE_TOKENS", 600)
 
     @field_validator("relational_mode", "relational_fusion", mode="before")
     @classmethod

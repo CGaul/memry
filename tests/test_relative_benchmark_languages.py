@@ -223,3 +223,16 @@ def test_the_cache_writes_a_single_new_text_at_most_once_a_minute(tmp_path):
     embedder.flush()
     assert set(json.loads(path.read_text())) == {"a", "b", "c"}
     assert embedder.unsaved == 0
+
+
+def test_a_ledger_cap_is_refused_without_a_ledger_and_parsed_with_one(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, tmp_path, "--max-calls", "chat=3", "--translate-questions",
+              str(tmp_path / "t.json"), "--dry-run")
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, tmp_path, "--usage-db", str(tmp_path / "u.db"), "--max-calls",
+              "words=3", "--translate-questions", str(tmp_path / "t.json"), "--dry-run")
+    # a dry run installs no meter and writes no ledger
+    _main(monkeypatch, tmp_path, "--usage-db", str(tmp_path / "u.db"), "--max-calls", "chat=3",
+          "--translate-questions", str(tmp_path / "t.json"), "--dry-run")
+    assert not (tmp_path / "u.db").exists()

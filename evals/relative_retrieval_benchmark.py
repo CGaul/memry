@@ -175,7 +175,10 @@ class CachedEmbedder(Embedder):
     def flush(self) -> None:
         """Write the texts embedded since the last write to the file."""
         if self.unsaved:
-            self.path.write_text(json.dumps(self.cache))
+            # whole or not at all: other runs read the same file
+            part = self.path.with_name(self.path.name + ".part")
+            part.write_text(json.dumps(self.cache))
+            part.replace(self.path)
             self.unsaved, self.saved_at = 0, time.monotonic()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -1865,6 +1868,12 @@ def main() -> None:
     parser.add_argument("--cache-only", action="store_true",
                         help="embed nothing (a free run): a text missing from the embedding "
                              "cache stops the run")
+    parser.add_argument("--usage-db", default=None, metavar="PATH",
+                        help="SQLite ledger of every model call, tokens as the responses "
+                             "report them (evals/api_usage.py)")
+    parser.add_argument("--max-calls", action="append", default=None, metavar="GROUP=N",
+                        help="stop before the call that would pass N calls of GROUP (chat, "
+                             "embeddings, jev, other) in the ledger; needs --usage-db")
     parser.add_argument("--tags", action="store_true",
                         help="tag every memory as an agent does when it saves (tag_world); "
                              "the store keeps the tags as the memories' categories")
@@ -1889,6 +1898,19 @@ def main() -> None:
         parser.error("--dry-run is for --write-questions or --translate-questions")
     if args.says and args.vectors == "ordinary":
         parser.error("--says gives property vectors: it cannot go with --vectors ordinary")
+    if args.max_calls and not args.usage_db:
+        parser.error("--max-calls needs --usage-db")
+    caps: dict[str, int] = {}
+    for item in args.max_calls or []:
+        group, _, number = item.partition("=")
+        if group not in ("chat", "embeddings", "jev", "other") or not number.isdigit():
+            parser.error(f"--max-calls {item!r}: GROUP=N with GROUP chat, embeddings, jev "
+                         "or other")
+        caps[group] = int(number)
+    if args.usage_db and not args.dry_run:
+        import api_usage  # evals/ is on the path
+
+        api_usage.UsageMeter(args.usage_db, caps=caps).install()
     decider = None
     try:
         modes = select_modes(args.modes)

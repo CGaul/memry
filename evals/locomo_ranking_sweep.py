@@ -29,7 +29,11 @@ reference date (LoCoMo's last session), so that recency counts; by default
 the clock is today's, which makes every memory of 2023 equally old.
 
     python evals/locomo_ranking_sweep.py --one OUT.json [--clock reference]
-    python evals/locomo_ranking_sweep.py --outdir OUT [--sweeps RRF_K ...] [--jobs 2]
+    python evals/locomo_ranking_sweep.py --outdir OUT [--sweeps RRF_K ...] [--jobs 2] [--plain]
+
+``--plain`` searches with ``relational=False``: the text ranking alone orders
+the results, as the dense world's ``hybrid`` mode. Memry's own search orders
+1,527 of the 1,540 questions by the linked search.
 """
 
 from __future__ import annotations
@@ -82,7 +86,7 @@ METRICS = ("recall@5", "recall@10", "recall@20", "mrr", "pool@20", "pool@30", "p
 # one setting
 
 
-def run_one(out: pathlib.Path, clock: str) -> None:
+def run_one(out: pathlib.Path, clock: str, relational: bool = True) -> None:
     from evals import external_benchmarks as xb
     import memry.retrieval as retrieval
     from memry.config import Config
@@ -187,7 +191,7 @@ def run_one(out: pathlib.Path, clock: str) -> None:
             before = len(base.misses)
             seen.clear()
             results = store.search(q.question, user_id=xb.BENCH_USER, limit=LIMIT,
-                                   evidence=False)
+                                   evidence=False, relational=relational)
             missed = len(base.misses) - before
             misses_by_q += bool(missed)
             units = [turns_of(r.memory) for r in results[:LIMIT]]
@@ -209,7 +213,7 @@ def run_one(out: pathlib.Path, clock: str) -> None:
     embedder.release()
     shutil.rmtree(work)
     out.write_text(json.dumps({
-        "config": config_seen, "clock": clock,
+        "config": config_seen, "clock": clock, "relational": relational,
         "env": {k: v for k, v in os.environ.items() if k.startswith("MEMRY_RANK_")},
         "questions": len(rows), "misses": len(base.misses),
         "questions_with_a_miss": misses_by_q, "missed_texts": base.misses[:50],
@@ -225,26 +229,27 @@ def same(name: str, value: str) -> bool:
     return float(value) == float(TODAY[name])
 
 
-def tag_of(setting: dict[str, str], clock: str = "today") -> str:
+def tag_of(setting: dict[str, str], clock: str = "today", plain: bool = False) -> str:
     tag = ",".join(f"{k}={v}" for k, v in sorted(setting.items())) or "today"
-    return tag + ("" if clock == "today" else "@reference")
+    return tag + ("" if clock == "today" else "@reference") + ("@plain" if plain else "")
 
 
 def run_all(jobs_list: list[tuple[dict[str, str], str]], outdir: pathlib.Path,
-            jobs: int) -> None:
-    todo = [(s, c) for s, c in jobs_list if not (outdir / f"{tag_of(s, c)}.json").exists()]
+            jobs: int, plain: bool = False) -> None:
+    todo = [(s, c) for s, c in jobs_list
+            if not (outdir / f"{tag_of(s, c, plain)}.json").exists()]
     running = []
     while todo or running:
         while todo and len(running) < jobs:
             setting, clock = todo.pop(0)
-            tag = tag_of(setting, clock)
+            tag = tag_of(setting, clock, plain)
             env = {k: v for k, v in os.environ.items() if not k.startswith("MEMRY_RANK_")}
             env.pop("OPENAI_API_KEY", None)
             env.update({f"MEMRY_RANK_{k}": v for k, v in setting.items()})
             log = (outdir / f"{tag}.log").open("w")
             process = subprocess.Popen(
                 [sys.executable, __file__, "--one", str(outdir / f"{tag}.json"),
-                 "--clock", clock], env=env, stdout=log, stderr=subprocess.STDOUT)
+                 "--clock", clock] + (["--plain"] if plain else []), env=env, stdout=log, stderr=subprocess.STDOUT)
             running.append((process, tag))
             print(f"started {tag}", flush=True)
         time.sleep(5)
@@ -327,9 +332,12 @@ def main() -> None:
     parser.add_argument("--outdir", default=None)
     parser.add_argument("--sweeps", nargs="*", default=None, choices=list(SWEEPS))
     parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--plain", action="store_true",
+                        help="search with relational=False: the text ranking alone orders "
+                             "every question, as the dense world's hybrid mode")
     args = parser.parse_args()
     if args.one:
-        run_one(pathlib.Path(args.one), args.clock)
+        run_one(pathlib.Path(args.one), args.clock, relational=not args.plain)
         return
     if not args.outdir:
         parser.error("--one or --outdir")
@@ -345,20 +353,23 @@ def main() -> None:
                 todo.append(({name: v}, "today"))
                 if name in CLOCKED:
                     todo.append(({name: v}, "reference"))
-    run_all(todo, outdir, args.jobs)
+    run_all(todo, outdir, args.jobs, args.plain)
     parts = []
     for name in names:
         for clock in ("today",) + (("reference",) if name in CLOCKED else ()):
-            base = outdir / f"{tag_of({}, clock)}.json"
+            base = outdir / f"{tag_of({}, clock, args.plain)}.json"
             rows = [(f"**{v}** (today)" if same(name, v) else v,
-                     base if same(name, v) else outdir / f"{tag_of({name: v}, clock)}.json")
+                     base if same(name, v)
+                     else outdir / f"{tag_of({name: v}, clock, args.plain)}.json")
                     for v in SWEEPS[name]]
-            title = name + ("" if clock == "today" else ", clock at the reference date")
+            title = (name + ("" if clock == "today" else ", clock at the reference date")
+                     + (", the text ranking alone" if args.plain else ""))
             parts.append(table(title, rows, base))
             parts.append(category_table(title, rows))
     text = "\n\n".join(parts)
     print(text)
-    (outdir / f"sweeps_{'_'.join(args.sweeps or ['all'])}.md").write_text(text + "\n")
+    plain = "_plain" if args.plain else ""
+    (outdir / f"sweeps_{'_'.join(args.sweeps or ['all'])}{plain}.md").write_text(text + "\n")
 
 
 if __name__ == "__main__":

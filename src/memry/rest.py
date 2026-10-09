@@ -4338,6 +4338,15 @@ def create_app(
                     needs_decider=True,
                 ),
                 entry(
+                    "self_test", "Self-test",
+                    "Searches each memory's own stored questions, without the "
+                    "judge, and records where the memory ranks. A memory none of "
+                    "its questions returns in the top 20 is counted as hard to "
+                    "find. Nothing is changed. Off unless MEMRY_SELF_TEST=1 and "
+                    "question keys are on.",
+                    needs_llm=False,
+                ),
+                entry(
                     "consolidation", "Memory consolidation",
                     "Finds memories that record the same fact more than once. "
                     "Word-for-word duplicates are merged on sight; merges the "

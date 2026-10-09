@@ -609,7 +609,11 @@ def test_maintenance_status_lists_every_automatic_pass(client):
     """Background work that rewrites memories must be inspectable."""
     info = client.get("/api/v1/maintenance?user_id=u").json()
     passes = {p["key"]: p for p in info["passes"]}
-    assert set(passes) == {"dedup_entities", "consolidation", "durability", "structure"}
+    assert set(passes) == {"dedup_entities", "consolidation", "durability", "structure",
+                           "self_test"}
+    # the self-test is off unless its switch and the question keys are on
+    assert passes["self_test"]["automatic"] is False
+    assert passes["self_test"]["toggleable"] is False
     # durability needs a decision provider, and says so rather than failing quietly
     assert passes["durability"]["needs_decider"] is True
     assert info["decider_available"] is False

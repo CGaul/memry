@@ -739,6 +739,20 @@ class MemoryBackend(ABC):
         """Valid memories with no question key at all, oldest first."""
         return []
 
+    def set_self_test(self, rows: list[dict[str, Any]]) -> None:
+        """Keep these self-test results, one per memory."""
+        return None
+
+    def self_test_rows(self, scope: Scope) -> list[dict[str, Any]]:
+        """The last self-test result of each valid memory in scope."""
+        return []
+
+    def memories_due_self_test(
+        self, scope: Scope, tested_before: str, limit: int = 100_000,
+    ) -> list[Memory]:
+        """Valid memories with question keys not tested since ``tested_before``."""
+        return []
+
     def question_keyword_search(
         self, query: str, scope: Scope, limit: int = 20, include_invalid: bool = False,
         categories: list[str] | None = None, entity_id: str | None = None,

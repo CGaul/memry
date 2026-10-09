@@ -1353,6 +1353,113 @@ class MemoryStore:
             summary["proposals"] = proposals
         return summary
 
+    # --- the nightly self-test (``upkeep.self_test``) ------------------------
+
+    def self_test_memories(
+        self, memories: list[Memory], *, relational: bool = True,
+        question_keys: bool = False, depth: int | None = None, record: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Search each memory's own question keys and keep where the memory
+        ranks: one row per memory with questions (``memory_id``; ``rank``,
+        its best rank over them, None when each ranks it past ``depth``;
+        ``question``, the question of that rank, the first one when none
+        ranks it; ``firsts``, per question [n, rank or None, the memory
+        ranked first]; ``tested_at``).
+
+        The search is Memry's as a person gets it (the linked search for a
+        question about a known entity, the text ranking otherwise; only the
+        text ranking with ``relational`` False), without the judge, and with
+        ``question_keys`` False without the keys: compared with itself, a
+        question always ranks its own memory first. A memory whose search
+        fails is logged and left untested. ``record`` keeps the rows
+        (``backend.set_self_test``)."""
+        depth = max(int(depth or self.config.upkeep.self_test_depth), 1)
+        asked = self.backend.questions_of([m.id for m in memories])
+        stamp = utcnow()
+        rows: list[dict[str, Any]] = []
+        for memory in memories:
+            questions = asked.get(memory.id) or []
+            if not questions:
+                continue
+            firsts: list[list[Any]] = []
+            try:
+                for question in questions:
+                    found = self.search(
+                        question["text"], user_id=memory.user_id, limit=depth,
+                        relational=relational, evidence=False, judge=False,
+                        question_keys=question_keys)
+                    ids = [r.memory.id for r in found[:depth]]
+                    rank = ids.index(memory.id) + 1 if memory.id in ids else None
+                    firsts.append([question["n"], rank, ids[0] if ids else None])
+            except Exception as exc:
+                log.warning("self-test: %s not tested: %s", memory.id, exc)
+                continue
+            ranked = [f for f in firsts if f[1] is not None]
+            best = min(ranked, key=lambda f: f[1]) if ranked else firsts[0]
+            rows.append({
+                "memory_id": memory.id, "rank": best[1],
+                "question": next(q["text"] for q in questions if q["n"] == best[0]),
+                "firsts": firsts, "tested_at": stamp,
+            })
+        if record and rows:
+            self.backend.set_self_test(rows)
+        return rows
+
+    def run_self_test(
+        self, *, user_id: str | None = None, exact_user: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """The upkeep pass: test the memories with question keys not tested
+        for ``upkeep.self_test_interval_days`` (the never tested first), up
+        to ``upkeep.self_test_batch``, then report the namespace
+        (``self_test_report``). No model call: one search per question."""
+        cfg = self.config.upkeep
+        now = now or datetime.now(timezone.utc)
+        before = (now - timedelta(days=cfg.self_test_interval_days)).isoformat(
+            timespec="seconds")
+        due = self.backend.memories_due_self_test(
+            Scope(user_id=user_id, exact_user=exact_user), before,
+            limit=max(int(cfg.self_test_batch), 0))
+        started = time.perf_counter()
+        rows = self.self_test_memories(due)
+        outcome: dict[str, Any] = {
+            "tested": len(rows), "searches": sum(len(r["firsts"]) for r in rows),
+            "ms": round((time.perf_counter() - started) * 1000)}
+        report = self.self_test_report(user_id=user_id, exact_user=exact_user)
+        outcome["hard_to_find"] = report["hard_to_find"]
+        outcome["duplicate_candidates"] = len(report["duplicate_candidates"])
+        return outcome
+
+    def self_test_report(
+        self, *, user_id: str | None = None, exact_user: bool = False,
+    ) -> dict[str, Any]:
+        """What the last self-tests of a namespace's memories came to:
+        ``tested``; ``hard_to_find``, the count of memories every question of
+        which ranked them past the depth tested, with their ids
+        (``hard_to_find_ids``); and ``duplicate_candidates``, each pair of
+        memories where the other memory came first for a question of the
+        memory (``memory_id``, ``other_id``; ``questions``, of ``of``, the
+        memory's questions with the other first; ``mutual``, the memory first
+        for a question of the other too), the mutual ones first, then those
+        with the other first for every question."""
+        rows = self.backend.self_test_rows(Scope(user_id=user_id, exact_user=exact_user))
+        hard = [r["memory_id"] for r in rows if r["rank"] is None]
+        firsts: dict[tuple[str, str], tuple[int, int]] = {}
+        for row in rows:
+            others = Counter(f[2] for f in row["firsts"] if f[2] and f[2] != row["memory_id"])
+            for other, count in others.items():
+                firsts[(row["memory_id"], other)] = (count, len(row["firsts"]))
+        candidates: list[dict[str, Any]] = []
+        for (a, b), (count, of) in sorted(firsts.items()):
+            mutual = (b, a) in firsts
+            if mutual and b < a:
+                continue  # the pair once, under its first id
+            candidates.append({"memory_id": a, "other_id": b, "questions": count, "of": of,
+                               "mutual": mutual})
+        candidates.sort(key=lambda c: (not c["mutual"], c["questions"] < c["of"]))
+        return {"tested": len(rows), "hard_to_find": len(hard), "hard_to_find_ids": hard,
+                "duplicate_candidates": candidates}
+
     def _property_vectors_after_save(self, memory_ids: list[str]) -> None:
         """Property vectors of memories just saved or edited, once their
         mentions are attached. A failure never fails the save: the weekly
@@ -2109,6 +2216,8 @@ class MemoryStore:
         relational: bool = True,
         evidence: bool = True,
         filters: Filters | None = None,
+        judge: bool = True,
+        question_keys: bool | None = None,
     ) -> list[SearchResult]:
         """The memories that best answer ``query``, best first.
 
@@ -2145,7 +2254,12 @@ class MemoryStore:
         others: those read in SQL join ``categories`` and ``entity_id``, and
         the rest are read once over the scope (``_admitted``) into the set
         of memories every stage keeps to (``_Reads.among``), so a memory
-        they drop is never a candidate, however well it matches."""
+        they drop is never a candidate, however well it matches.
+
+        ``judge`` False runs no judge whatever ``relevance_mode()`` is, and
+        ``question_keys`` True or False reads the question keys or not
+        whatever ``retrieval.question_keys`` is: the self-test
+        (``self_test_memories``) ranks a memory's text without either."""
         scope = Scope(user_id=user_id, agent_id=agent_id, run_id=run_id)
         if filters is not None:
             filters = self.resolve_filters(filters, user_id=user_id, agent_id=agent_id)
@@ -2179,10 +2293,11 @@ class MemoryStore:
         reads = _Reads(scope, include_invalid, categories, entity_id, since, until,
                        when_since, when_until, among)
         # 1. the seeds, the question as it is read, and whether it is judged
-        plan = self._plan(query, reads, relational)
+        plan = self._plan(query, reads, relational, judge=judge)
         # 2. the candidates: the text ranking, as deep for every search
         query_vector = self._query_vector(query)  # the ranking and the evidence read it
-        results = self._text_ranking(query, reads, limit, query_vector)
+        results = self._text_ranking(query, reads, limit, query_vector,
+                                     question_keys=question_keys)
         # 2 to 4. the linked pool, the order and the judged pool
         ranked = self._search_linked(query, scope, results, include_invalid, plan=plan)
         # 5 and 6. the judge and the set call
@@ -2201,16 +2316,22 @@ class MemoryStore:
 
     def _text_ranking(
         self, query: str, reads: _Reads, limit: int, query_vector: list[float] | None = None,
+        question_keys: bool | None = None,
     ) -> list[SearchResult]:
         """Stage 2's text ranking: keyword and vector candidates fused
         (``retrieval.hybrid_search``), as deep for every search (eight per
         result asked for, at least 40 and at most 500), of what the search
         reads (``reads``). What was true until an update replaced it is read
         too, for questions about the past (``_final_order`` puts it after the
-        current value). ``query_vector`` None embeds the query."""
+        current value). ``query_vector`` None embeds the query.
+        ``question_keys`` True or False overrides ``retrieval.question_keys``
+        for this ranking."""
+        cfg = self.config.retrieval
+        if question_keys is not None and question_keys != cfg.question_keys:
+            cfg = cfg.model_copy(update={"question_keys": question_keys})
         return [r for r in hybrid_search(
             backend=self.backend, embedder=self.embedder, query=query, scope=reads.scope,
-            limit=min(max(limit * 8, 40), 500), cfg=self.config.retrieval,
+            limit=min(max(limit * 8, 40), 500), cfg=cfg,
             include_invalid=reads.include_invalid, categories=reads.categories,
             entity_id=reads.entity_id, history=True, query_vector=query_vector,
             **reads.kept_to(),
@@ -2237,7 +2358,9 @@ class MemoryStore:
             return [owner.id], True
         return [], False
 
-    def _plan(self, query: str, reads: _Reads, relational: bool) -> _SearchPlan:
+    def _plan(
+        self, query: str, reads: _Reads, relational: bool, judge: bool = True,
+    ) -> _SearchPlan:
         """A search's seeds (stage 1, none with ``relational=False``), the
         question as the linked order and the judge read it, and whether the
         decision provider judges it.
@@ -2256,7 +2379,7 @@ class MemoryStore:
             question = mask_names(query, self.backend.entity_aliases(seeds[0]))
             if first_person:
                 question = mask_first_person(question)
-        judges = bool(self.decider.available) and self.relevance_mode() == "jev"
+        judges = judge and bool(self.decider.available) and self.relevance_mode() == "jev"
         return _SearchPlan(reads=reads, seeds=seeds, first_person=first_person,
                            question=question, judges=judges)
 
@@ -6013,7 +6136,7 @@ class MemoryStore:
     # so the dashboard toggle survives restarts; config stays the default when
     # no override was ever set.
     _MAINTENANCE_KEYS = (
-        "dedup_entities", "durability", "consolidation", "structure",
+        "dedup_entities", "durability", "consolidation", "structure", "self_test",
     )
     #: The passes a config switch gates, with why one is off while its
     #: switch is: a stored toggle cannot turn such a pass on
@@ -6023,6 +6146,8 @@ class MemoryStore:
     _CONFIG_GATES: dict[str, tuple[Callable[[Config], bool], str]] = {
         "durability": (lambda config: config.decay.durability,
                        "decay.durability is off (MEMRY_DURABILITY)"),
+        "self_test": (lambda config: config.upkeep.self_test and config.retrieval.question_keys,
+                      "upkeep.self_test (MEMRY_SELF_TEST) or retrieval.question_keys is off"),
     }
 
     #: How many memories one durability pass scores. Jev answers 128 questions
@@ -6104,7 +6229,7 @@ class MemoryStore:
             return self.decider.available
         if key == "consolidation":
             return self.llm.available
-        if key == "structure":
+        if key in ("structure", "self_test"):
             return True
         return False
 
@@ -6419,6 +6544,8 @@ class MemoryStore:
             elif key == "consolidation":
                 result = self.run_consolidation_pass(user_id=user_id, exact_user=exact_user)
                 self.backend.set_meta(_consolidation_run_key(user_id), stamp)
+            elif key == "self_test":
+                result = self.run_self_test(user_id=user_id, exact_user=exact_user, now=at)
             else:
                 raise ValueError(f"unknown pass: {key}")
             if record:
@@ -6477,6 +6604,15 @@ class MemoryStore:
                 self._upkeep_set("last:durability", user_id,
                                  {"at": now.isoformat(timespec="seconds"), "result": result})
                 ran["durability"] = result
+        if self.maintenance_enabled("self_test"):
+            # Each memory is due once a day (``upkeep.self_test_interval_days``),
+            # so a tick with none due searches nothing and is no run.
+            result = self.run_upkeep_pass("self_test", user_id=user_id, record=False, at=now,
+                                          exact_user=exact_user)
+            if result.get("tested"):
+                self._upkeep_set("last:self_test", user_id,
+                                 {"at": now.isoformat(timespec="seconds"), "result": result})
+                ran["self_test"] = result
         if dedup_due:
             # After this week's merges and new homes: re-embed the memories
             # whose masked names changed. Nothing to embed is no run.

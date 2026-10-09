@@ -261,6 +261,23 @@ class DecayConfig(BaseModel):
     )
 
 
+class UpkeepConfig(BaseModel):
+    #: The nightly self-test (``MemoryStore.run_self_test``): each memory's
+    #: own question keys are asked to Memry's search, without the judge and
+    #: without the keys, and where the memory ranks is kept. A memory every
+    #: question of which ranks it past ``self_test_depth`` is "hard to find";
+    #: another memory first for a memory's question is a duplicate
+    #: candidate. Off unless set (MEMRY_SELF_TEST), and only with
+    #: ``retrieval.question_keys``. Measured on the dense world (PhD notes,
+    #: memry-field-studies, self-test).
+    self_test: bool = False
+    #: The rank past which a memory counts as not returned.
+    self_test_depth: int = 20
+    #: Days between two tests of one memory, and memories tested a pass.
+    self_test_interval_days: float = 1.0
+    self_test_batch: int = 5000
+
+
 class AnnConfig(BaseModel):
     """Approximate-nearest-neighbor settings (usearch HNSW sidecar).
 
@@ -333,6 +350,7 @@ class Config(BaseModel):
     supersede: SupersedeConfig = Field(default_factory=SupersedeConfig)
     ann: AnnConfig = Field(default_factory=AnnConfig)
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
+    upkeep: UpkeepConfig = Field(default_factory=UpkeepConfig)
 
     # ------------------------------------------------------------------
     @classmethod
@@ -460,6 +478,7 @@ def _from_env() -> dict[str, Any]:
     put(None, "public_url", e("MEMRY_PUBLIC_URL"))
 
     put("decay", "durability", _bool(e("MEMRY_DURABILITY")))
+    put("upkeep", "self_test", _bool(e("MEMRY_SELF_TEST")))
     put("snapshot", "dir", e("MEMRY_SNAPSHOT_DIR"))
     put("snapshot", "at", e("MEMRY_SNAPSHOT_AT"))
     put("snapshot", "host_dir", e("MEMRY_SNAPSHOT_HOST_DIR"))

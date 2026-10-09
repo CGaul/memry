@@ -140,6 +140,19 @@ CREATE TRIGGER IF NOT EXISTS memory_questions_au AFTER UPDATE OF text ON memory_
     VALUES ('delete', old.rowid, old.text);
     INSERT INTO memory_questions_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
+-- The nightly self-test (``MemoryStore.run_self_test``): where a memory ranks
+-- when its own question keys are searched. rank: its best rank over them, NULL
+-- when every one ranks it past the depth tested; question: the question of
+-- that rank (the first one when none ranks it); firsts: JSON, per question
+-- [n, rank or null, the memory ranked first]. Derived, so not in backups, and
+-- dropped when the memory's questions change.
+CREATE TABLE IF NOT EXISTS memory_self_test (
+    memory_id TEXT PRIMARY KEY,
+    rank INTEGER DEFAULT NULL,
+    question TEXT NOT NULL,
+    firsts TEXT NOT NULL DEFAULT '[]',
+    tested_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_memories_invalid ON memories(invalid_at);
 -- what a memory replaced, read when it is deleted for good (``replaced_by``)
 CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by)
@@ -1622,6 +1635,7 @@ class LocalBackend(MemoryBackend):
                 self._db.execute(
                     "DELETE FROM memory_property_vectors WHERE memory_id = ?", (memory_id,))
                 self._db.execute("DELETE FROM memory_questions WHERE memory_id = ?", (memory_id,))
+                self._db.execute("DELETE FROM memory_self_test WHERE memory_id = ?", (memory_id,))
                 # what it replaced has nothing standing in for it any more
                 self._db.execute(
                     "UPDATE memories SET superseded_by = NULL WHERE superseded_by = ?",
@@ -3133,6 +3147,8 @@ class LocalBackend(MemoryBackend):
         without one), stored in float16."""
         with self._lock:
             self._db.execute("DELETE FROM memory_questions WHERE memory_id = ?", (memory_id,))
+            # a test of the questions it had says nothing of the new ones
+            self._db.execute("DELETE FROM memory_self_test WHERE memory_id = ?", (memory_id,))
             for n, (text, source) in enumerate(questions):
                 vector = vectors[n] if vectors and n < len(vectors) else None
                 self._db.execute(
@@ -3200,6 +3216,51 @@ class LocalBackend(MemoryBackend):
                 "AND json_extract(m.metadata, '$.questions_checked') IS NULL "
                 "ORDER BY m.created_at, m.id LIMIT ?",
                 (*params, limit)).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def set_self_test(self, rows: list[dict[str, Any]]) -> None:
+        """Keep these self-test results, one per memory (``memory_id``,
+        ``rank``, ``question``, ``firsts``, ``tested_at``), in place of the
+        memory's last."""
+        with self._lock:
+            for row in rows:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO memory_self_test "
+                    "(memory_id, rank, question, firsts, tested_at) VALUES (?, ?, ?, ?, ?)",
+                    (row["memory_id"], row["rank"], row["question"],
+                     json.dumps(row["firsts"]), row["tested_at"]))
+            self._commit()
+
+    def self_test_rows(self, scope: Scope) -> list[dict[str, Any]]:
+        """The last self-test result of each valid memory in ``scope`` that
+        has one, by memory id."""
+        clause, params = _scope_clause(scope, prefix="m.")
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT t.memory_id, t.rank, t.question, t.firsts, t.tested_at "
+                "FROM memory_self_test t JOIN memories m ON m.id = t.memory_id "
+                f"WHERE {clause} AND m.invalid_at IS NULL ORDER BY t.memory_id",
+                params).fetchall()
+        return [{"memory_id": r["memory_id"], "rank": r["rank"], "question": r["question"],
+                 "firsts": json.loads(r["firsts"] or "[]"), "tested_at": r["tested_at"]}
+                for r in rows]
+
+    def memories_due_self_test(
+        self, scope: Scope, tested_before: str, limit: int = 100_000,
+    ) -> list[Memory]:
+        """Valid memories in ``scope`` with question keys, never tested or last
+        tested before ``tested_before``: the never tested first, then the
+        longest untested."""
+        clause, params = _scope_clause(scope, prefix="m.")
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_prefixed(_MEMORY_COLS, 'm')} FROM memories m "
+                "LEFT JOIN memory_self_test t ON t.memory_id = m.id "
+                f"WHERE {clause} AND m.invalid_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM memory_questions q WHERE q.memory_id = m.id) "
+                "AND (t.tested_at IS NULL OR t.tested_at < ?) "
+                "ORDER BY t.tested_at IS NOT NULL, t.tested_at, m.id LIMIT ?",
+                (*params, tested_before, limit)).fetchall()
         return [_row_to_memory(row) for row in rows]
 
     def question_keyword_search(

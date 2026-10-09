@@ -58,6 +58,17 @@ write them (2 or 3 a memory, 25 memories a call) and keeps them in FILE for
 the next run. The questions belong to the world, not to a store: one file
 serves every store built from the same world, keyed by size.
 
+Two languages: ``--question-languages en de`` tells that writer the store's
+languages (``extraction.question_languages``), so it writes at least one
+question in each. ``--add-questions FILE --add-language de`` (with
+``--questions``) adds each memory's first German question of FILE to its
+questions. ``--translate-questions FILE`` asks the text model to translate
+the benchmark's questions (``--translate-to``, German by default; 25 a call,
+names kept) and stops; ``--questions-translated FILE`` scores with them.
+``--dry-run`` prints the model calls and estimated tokens of a writing step
+and stops before any call. ``--cache-only`` embeds nothing: a text missing
+from the embedding cache stops the run.
+
 Run:
     OPENAI_API_KEY=... python evals/relative_retrieval_benchmark.py      # real embeddings
     python evals/relative_retrieval_benchmark.py --sizes 1500             # hash, offline
@@ -69,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import random
@@ -86,7 +98,14 @@ sys.path.insert(0, str(HERE))
 from memry.config import Config, EmbeddingConfig  # noqa: E402
 from memry.models import Entity, EntityMention, Memory, MergeProposal, Relation  # noqa: E402
 from memry.providers.embeddings import Embedder, HashEmbedder, OpenAIEmbedder  # noqa: E402
-from memry.intelligence.questions import QUESTIONS_PER_MEMORY, clean_questions  # noqa: E402
+from memry.intelligence.questions import (  # noqa: E402
+    QUESTIONS_PER_MEMORY,
+    clean_questions,
+    detect_language,
+    language_instruction,
+    language_names,
+    merge_questions,
+)
 from memry.providers.llm import LLM, NoneLLM, build_llm  # noqa: E402
 from memry.store import MemoryStore, _cut, _text_hash  # noqa: E402
 
@@ -124,12 +143,19 @@ TOPICWORDS = ["roadmap", "budget", "latency", "hiring", "design", "billing", "ou
 
 
 class CachedEmbedder(Embedder):
-    """One vector per distinct text, fetched in batches and kept on disk."""
+    """One vector per distinct text, fetched in batches and kept on disk.
+
+    The file is written at most once every ``SAVE_EVERY`` seconds and on
+    ``flush``: a search embeds its masked question one text at a time, and
+    writing the whole file (170 MB) for each new text stalled a run."""
+
+    SAVE_EVERY = 60.0
 
     def __init__(self, base: Embedder, path: pathlib.Path) -> None:
         self.base, self.path = base, path
         self.name, self._model, self.dimensions = base.name, base._model, base.dimensions
         self.cache: dict[str, list[float]] = {}
+        self.unsaved, self.saved_at = 0, time.monotonic()
         if path.exists():
             self.cache = json.loads(path.read_text())
 
@@ -139,13 +165,34 @@ class CachedEmbedder(Embedder):
             batch = missing[i:i + 256]
             for text, vector in zip(batch, self.base.embed(batch)):
                 self.cache[text] = [round(float(x), 6) for x in vector]
-            print(f"  embedded {min(i + 256, len(missing))}/{len(missing)}", flush=True)
-        if missing:
+            self.unsaved += len(batch)
+            if len(missing) > 1:
+                print(f"  embedded {min(i + 256, len(missing))}/{len(missing)}", flush=True)
+        if self.unsaved and (len(missing) > 1
+                             or time.monotonic() - self.saved_at > self.SAVE_EVERY):
+            self.flush()
+
+    def flush(self) -> None:
+        """Write the texts embedded since the last write to the file."""
+        if self.unsaved:
             self.path.write_text(json.dumps(self.cache))
+            self.unsaved, self.saved_at = 0, time.monotonic()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.warm(texts)
         return [self.cache[t] for t in texts]
+
+
+class CacheOnly(Embedder):
+    """The OpenAI embedder's name and size with no calls: under
+    ``CachedEmbedder`` it reads the same cache file, and a text the cache
+    lacks raises instead of being embedded (``--cache-only``)."""
+
+    name, _model, dimensions = "openai", "text-embedding-3-small", 1536
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError(f"{len(texts)} texts are not in the embedding cache "
+                           f"(--cache-only), for example {texts[0]!r}")
 
 
 def words(n: int, rnd: random.Random) -> list[str]:
@@ -1375,13 +1422,24 @@ QUESTIONS_SCHEMA: dict = {
 QUESTIONS_BATCH = 25
 
 
-def ask_questions(llm: LLM, texts: list[str]) -> list[list[str]]:
+def questions_system(languages: list[str] | None = None) -> str:
+    """``QUESTIONS_SYSTEM``, with the store's languages before the answer's
+    shape when given (``intelligence.questions.language_instruction``)."""
+    extra = language_instruction(languages)
+    if not extra:
+        return QUESTIONS_SYSTEM
+    return QUESTIONS_SYSTEM.replace("\nAnswer with JSON only", f"\n{extra}\nAnswer with JSON only", 1)
+
+
+def ask_questions(llm: LLM, texts: list[str],
+                  languages: list[str] | None = None) -> list[list[str]]:
     """The questions the text model writes for each of ``texts`` in one call,
     in their order, each list cleaned (``clean_questions``) and at most
     ``QUESTIONS_PER_MEMORY`` long. A memory the answer skips, or an answer that
-    cannot be read, gives an empty list."""
+    cannot be read, gives an empty list. ``languages``: at least one question
+    in each (``questions_system``)."""
     user = "\n".join(f"{n}. {text}" for n, text in enumerate(texts, start=1))
-    raw = llm.complete(QUESTIONS_SYSTEM, user, json_schema=QUESTIONS_SCHEMA)
+    raw = llm.complete(questions_system(languages), user, json_schema=QUESTIONS_SCHEMA)
     out: list[list[str]] = [[] for _ in texts]
     try:
         items = json.loads(raw[raw.index("{"):raw.rindex("}") + 1]).get("items")
@@ -1395,8 +1453,8 @@ def ask_questions(llm: LLM, texts: list[str]) -> list[list[str]]:
 
 
 def write_world_questions(llm: LLM, texts: list[str], known: dict[str, list[str]], save,
-                          batch: int = QUESTIONS_BATCH, workers: int = 4
-                          ) -> dict[str, list[str]]:
+                          batch: int = QUESTIONS_BATCH, workers: int = 4,
+                          languages: list[str] | None = None) -> dict[str, list[str]]:
     """``known`` (memory index as a string: its questions) completed with the
     questions of every memory of ``texts`` it lacks, ``batch`` memories a call
     and ``workers`` calls at a time. ``save`` is called with the questions so
@@ -1412,7 +1470,7 @@ def write_world_questions(llm: LLM, texts: list[str], known: dict[str, list[str]
         again: list[int] = []
         chunks = [due[i:i + batch] for i in range(0, len(due), batch)]
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            asked = {pool.submit(ask_questions, llm, [texts[k] for k in chunk]): chunk
+            asked = {pool.submit(ask_questions, llm, [texts[k] for k in chunk], languages): chunk
                      for chunk in chunks}
             for future in as_completed(asked):
                 chunk = asked[future]
@@ -1432,6 +1490,145 @@ def write_world_questions(llm: LLM, texts: list[str], known: dict[str, list[str]
         if not due:
             break
     return questions
+
+
+def add_language_questions(base: dict[str, list[str]], extra: dict[str, list[str]],
+                           language: str) -> tuple[dict[str, list[str]], int]:
+    """Each memory's questions of ``base`` with the first of its ``extra``
+    questions read as ``language`` (``detect_language``) added after them,
+    and how many memories got one. A memory with no such question keeps
+    ``base``'s."""
+    merged: dict[str, list[str]] = {}
+    added = 0
+    for k in sorted(set(base) | set(extra), key=int):
+        own = clean_questions(base.get(k, []))
+        new = next((q for q in clean_questions(extra.get(k, []))
+                    if detect_language(q) == language), None)
+        merged[k] = merge_questions(own, [new]) if new else own
+        added += new is not None and new.casefold() not in {q.casefold() for q in own}
+    return merged, added
+
+
+#: What the text model is asked for a batch of the benchmark's questions
+#: (``--translate-questions``).
+TRANSLATE_SYSTEM = """You translate the questions a person asks a memory system.
+Translate each numbered question into {language}, as a {language} speaker would \
+ask it in a conversation. Keep every name exactly as written: people, products \
+and their versions and parts, events and their years, projects, companies, \
+places and cars. Never translate or change a name ("Brakadu planner v2" stays \
+"Brakadu planner v2").
+Answer with JSON only, one item for each question:
+{{"items": [{{"n": <the question's number>, "text": "..."}}]}}"""
+TRANSLATE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"n": {"type": "integer"}, "text": {"type": "string"}},
+        "required": ["n", "text"], "additionalProperties": False}}},
+    "required": ["items"], "additionalProperties": False,
+}
+
+
+def translate_questions(llm: LLM, questions: list[str], language: str) -> list[str | None]:
+    """The translation of each of ``questions`` into ``language`` in one
+    call, in their order, on one line; None where the answer skips one or
+    cannot be read."""
+    system = TRANSLATE_SYSTEM.format(language=language_names([language])[0])
+    user = "\n".join(f"{n}. {q}" for n, q in enumerate(questions, start=1))
+    raw = llm.complete(system, user, json_schema=TRANSLATE_SCHEMA)
+    out: list[str | None] = [None for _ in questions]
+    try:
+        items = json.loads(raw[raw.index("{"):raw.rindex("}") + 1]).get("items")
+    except (ValueError, AttributeError):
+        return out
+    for item in items if isinstance(items, list) else []:
+        n = item.get("n") if isinstance(item, dict) else None
+        text = item.get("text") if isinstance(item, dict) else None
+        if isinstance(n, int) and 1 <= n <= len(questions) and isinstance(text, str):
+            out[n - 1] = " ".join(text.split()) or None
+    return out
+
+
+def lost_names(question: str, translated: str, names: list[str]) -> list[str]:
+    """The names of ``names`` written in ``question`` that ``translated``
+    does not contain as written."""
+    return [n for n in names if n in question and n not in translated]
+
+
+def translate_world_questions(llm: LLM, due: list[str], known: dict[str, str],
+                              names: list[str], language: str, save,
+                              batch: int = QUESTIONS_BATCH, workers: int = 4) -> dict[str, str]:
+    """``known`` (question: translation) completed with the translations of
+    ``due``, ``batch`` questions a call and ``workers`` calls at a time.
+    ``save`` is called after every call. A question skipped, or translated
+    with a name of ``names`` changed, is asked once more in a later batch;
+    the second answer is kept with its name changed (counted), and a second
+    skip leaves it out."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    out = dict(known)
+    changed = 0
+    for last in (False, True):
+        again: list[str] = []
+        chunks = [due[i:i + batch] for i in range(0, len(due), batch)]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            asked = {pool.submit(translate_questions, llm, chunk, language): chunk
+                     for chunk in chunks}
+            for future in as_completed(asked):
+                chunk = asked[future]
+                try:
+                    got = future.result()
+                except Exception as exc:  # noqa: BLE001  one failed call stops nothing
+                    print(f"  no translation for {len(chunk)} questions: {exc}", flush=True)
+                    continue
+                for question, text in zip(chunk, got):
+                    if text and (last or not lost_names(question, text, names)):
+                        out[question] = text
+                        changed += bool(lost_names(question, text, names))
+                    elif not last:
+                        again.append(question)
+                save(out)
+                print(f"  translations for {len(out)} questions", flush=True)
+        due = again
+        if not due:
+            break
+    if changed:
+        print(f"  {changed} translations changed a name", flush=True)
+    return out
+
+
+def translated_queries(queries: dict, translations: dict[str, str]) -> tuple[dict, list[str]]:
+    """``queries`` with every question's text replaced by its translation,
+    the answers kept; and the questions with no translation (kept as they
+    are)."""
+    missing = [q for items in queries.values() for q, _, _ in items if q not in translations]
+    return ({family: [(translations.get(q, q), gold, wrong) for q, gold, wrong in items]
+             for family, items in queries.items()}, missing)
+
+
+#: Prices in dollars per million tokens (input, output), as of 2026-09-29
+#: (the PhD notes' ``data/locomo/prices.json``), for the dry run.
+PRICES = {"gpt-6-luna": (0.10, 0.50), "gpt-4o-mini": (0.15, 0.60)}
+
+
+def tokens(text: str) -> int:
+    """An estimate of a text's tokens: four characters a token."""
+    return max(1, math.ceil(len(text) / 4))
+
+
+def estimate(system: str, items: list[str], out_per_item, batch: int = QUESTIONS_BATCH) -> dict:
+    """The calls and tokens of asking about ``items``, ``batch`` a call with
+    ``system``, numbered as the writers number them; ``out_per_item(item)``
+    is an item's output tokens. The second pass (what the first skipped) is
+    not counted."""
+    calls = math.ceil(len(items) / batch) if items else 0
+    tokens_in = calls * (tokens(system) + 8) + sum(
+        tokens(f"{(k % batch) + 1}. {text}") for k, text in enumerate(items))
+    tokens_out = sum(out_per_item(item) for item in items)
+    return {"calls": calls, "items": len(items), "input_tokens": tokens_in,
+            "output_tokens": tokens_out,
+            "dollars": {model: round((tokens_in * p_in + tokens_out * p_out) / 1e6, 4)
+                        for model, (p_in, p_out) in PRICES.items()}}
 
 
 def keyed_by_size(data: dict) -> bool:
@@ -1641,6 +1838,33 @@ def main() -> None:
                        help="ask the configured text model (memry config) for the questions "
                             "of every memory of each size's world that PATH lacks, save them "
                             "to PATH keyed by size as --questions reads it, and run with them")
+    parser.add_argument("--question-languages", nargs="+", default=None, metavar="LANG",
+                        help="with --write-questions: tell the writer the store's languages "
+                             "(extraction.question_languages), so it writes at least one "
+                             "question in each")
+    parser.add_argument("--add-questions", default=None, metavar="PATH",
+                        help="with --questions: a second questions file; each memory's first "
+                             "question in --add-language is added to its questions")
+    parser.add_argument("--add-language", default=None, metavar="LANG",
+                        help="the language of the questions --add-questions adds (de, en, fr, es)")
+    parser.add_argument("--translate-questions", default=None, metavar="PATH",
+                        help="ask the text model to translate the benchmark's questions into "
+                             "--translate-to (25 a call, names kept), save them to PATH as "
+                             "{question: translation}, and stop")
+    parser.add_argument("--translate-to", default="de", metavar="LANG",
+                        help="the language of --translate-questions (German by default)")
+    parser.add_argument("--questions-translated", default=None, metavar="PATH",
+                        help="score with the benchmark's questions as translated in PATH "
+                             "(--translate-questions)")
+    parser.add_argument("--write-only", action="store_true",
+                        help="with --write-questions: write the file and stop, with no store "
+                             "and no embeddings")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --write-questions or --translate-questions: print the model "
+                             "calls and the estimated tokens, and stop before any call")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="embed nothing (a free run): a text missing from the embedding "
+                             "cache stops the run")
     parser.add_argument("--tags", action="store_true",
                         help="tag every memory as an agent does when it saves (tag_world); "
                              "the store keeps the tags as the memories' categories")
@@ -1655,6 +1879,14 @@ def main() -> None:
                         help="keep this many leading numbers of every vector the linked "
                              "search compares (retrieval.property_dimensions; all by default)")
     args = parser.parse_args()
+    if args.question_languages and not args.write_questions:
+        parser.error("--question-languages is for the writer: give --write-questions")
+    if args.add_questions and not (args.questions and args.add_language):
+        parser.error("--add-questions needs --questions and --add-language")
+    if args.write_only and not args.write_questions:
+        parser.error("--write-only is for --write-questions")
+    if args.dry_run and not (args.write_questions or args.translate_questions):
+        parser.error("--dry-run is for --write-questions or --translate-questions")
     if args.says and args.vectors == "ordinary":
         parser.error("--says gives property vectors: it cannot go with --vectors ordinary")
     decider = None
@@ -1687,14 +1919,19 @@ def main() -> None:
         judge.decide = counted
         return judge
     key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if key:
+    if args.cache_only:
+        base: Embedder = CacheOnly()
+        sizes = args.sizes or [2000, 10000]
+    elif key:
         base: Embedder = OpenAIEmbedder(EmbeddingConfig(provider="openai", api_key=key))
         sizes = args.sizes or [2000, 10000]
     else:
         base = HashEmbedder(128)
         sizes = args.sizes or [1500, 6000]
     cache = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / f"memry_relative_{base.name}.json"
-    embedder = CachedEmbedder(base, cache)
+    # a writing step that stops before the store reads no cache (170 MB)
+    writes_only = bool(args.translate_questions or args.write_only or args.dry_run)
+    embedder = CachedEmbedder(base, cache if not writes_only else pathlib.Path("/nonexistent"))
     answers = json.loads((HERE / "datasets" / "belongs_answers.json").read_text())["answers"]
     says = json.loads(pathlib.Path(args.says).read_text()) if args.says else None
     questions_path = args.questions or args.write_questions
@@ -1709,6 +1946,23 @@ def main() -> None:
     if args.questions and len(sizes) > 1 and not keyed_by_size(questions_file):
         parser.error("--questions without sizes as keys holds one world: run one size")
     question_llm: LLM | None = None
+
+    def text_model() -> LLM:
+        nonlocal question_llm
+        if question_llm is None:
+            question_llm = build_llm(Config.load().llm)
+            if not question_llm.available:
+                parser.error("writing needs a text model (memry config: "
+                             "MEMRY_LLM_PROVIDER, ANTHROPIC_API_KEY or OPENAI_API_KEY)")
+        return question_llm
+
+    translations: dict[str, str] = {}
+    translated_path = args.questions_translated or args.translate_questions
+    if translated_path and pathlib.Path(translated_path).exists():
+        translations = json.loads(pathlib.Path(translated_path).read_text())
+    elif args.questions_translated:
+        parser.error(f"{args.questions_translated} does not exist: write it with "
+                     "--translate-questions")
     results = {}
     for size in sizes:
         world = (build_world_dense(size, owner=args.owner) if args.world == "dense"
@@ -1716,16 +1970,48 @@ def main() -> None:
         if args.tags:
             tag_world(world)
         texts = [m["text"] for m in world["memories"]]
+        if args.translate_questions:
+            asked_texts = list(dict.fromkeys(
+                q for items in world["queries"].values() for q, _, _ in items))
+            due = [q for q in asked_texts if q not in translations]
+            language = language_names([args.translate_to])[0]
+            print(f"  {len(asked_texts)} questions, {len(due)} to translate into {language}",
+                  flush=True)
+            if args.dry_run:
+                # a translation is about a third longer than the question, plus its JSON
+                plan = estimate(TRANSLATE_SYSTEM.format(language=language), due,
+                                lambda q: math.ceil(tokens(q) * 1.35) + 12)
+                print("  dry run, translation: " + json.dumps(plan), flush=True)
+                continue
+            # longest first, so a version's name is checked before its product's
+            names = sorted(world["types"], key=len, reverse=True)
+
+            def keep(so_far: dict) -> None:
+                path = pathlib.Path(args.translate_questions)
+                part = path.with_name(path.name + ".part")
+                part.write_text(json.dumps(so_far, ensure_ascii=False, indent=0))
+                part.replace(path)
+
+            translations = translate_world_questions(text_model(), due, translations, names,
+                                                     args.translate_to, keep)
+            continue
+        if args.questions_translated:
+            world["queries"], missing = translated_queries(world["queries"], translations)
+            if missing:
+                parser.error(f"{args.questions_translated} has no translation for "
+                             f"{len(missing)} questions, for example {missing[0]!r}")
         questions: dict[str, list[str]] | None = None
         if args.write_questions:
             known = questions_file.get(str(size), {})
-            if any(str(k) not in known for k in range(len(texts))):
-                if question_llm is None:
-                    question_llm = build_llm(Config.load().llm)
-                    if not question_llm.available:
-                        parser.error("--write-questions needs a text model (memry config: "
-                                     "MEMRY_LLM_PROVIDER, ANTHROPIC_API_KEY or OPENAI_API_KEY)")
-
+            due = [k for k in range(len(texts)) if str(k) not in known]
+            if args.dry_run:
+                # 3 questions of 16 tokens a memory, and the JSON around them
+                plan = estimate(questions_system(args.question_languages),
+                                [texts[k] for k in due], lambda _: 3 * 16 + 12)
+                print(f"  dry run, questions for {len(due)} of {len(texts)} memories: "
+                      + json.dumps(plan), flush=True)
+                continue
+            if due:
                 def save(so_far: dict, size: int = size) -> None:
                     questions_file[str(size)] = so_far
                     path = pathlib.Path(args.write_questions)
@@ -1734,13 +2020,24 @@ def main() -> None:
                     part.replace(path)
 
                 print(f"  writing questions for {len(texts)} memories", flush=True)
-                known = write_world_questions(question_llm, texts, known, save)
+                known = write_world_questions(text_model(), texts, known, save,
+                                              languages=args.question_languages)
+            if args.write_only:
+                continue
             questions = known
         elif args.questions:
             questions = questions_for_size(questions_file, size)
             if questions is None:
                 parser.error(f"{args.questions} has no questions for size {size}; it has "
                              f"{', '.join(questions_file) or 'none'}")
+            if args.add_questions:
+                extra = questions_for_size(
+                    json.loads(pathlib.Path(args.add_questions).read_text()), size)
+                if extra is None:
+                    parser.error(f"{args.add_questions} has no questions for size {size}")
+                questions, added = add_language_questions(questions, extra, args.add_language)
+                print(f"  a question in {args.add_language} added to {added} of "
+                      f"{len(questions)} memories", flush=True)
         if questions is not None:
             beyond = [k for k in questions if not 0 <= int(k) < len(texts)]
             if beyond:
@@ -1797,7 +2094,8 @@ def main() -> None:
                     + f"  jev/search {res['_jev_calls_per_search']:.2f}", flush=True)
                 print(family_table(res), flush=True)
             store.close()
-    if args.out:
+            embedder.flush()
+    if args.out and results:
         pathlib.Path(args.out).write_text(json.dumps(results, indent=1))
 
 

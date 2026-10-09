@@ -19,6 +19,8 @@ two more candidate lists (``retrieval.hybrid_search``).
 
 from __future__ import annotations
 
+import re
+import textwrap
 from typing import Any
 
 #: Metadata mark on a memory the backfill asked about and got no question
@@ -38,6 +40,58 @@ QUESTIONS_RULE = """- questions: 2 or 3 questions this fact answers, as the pers
   thing the fact says. At least one uses other words than the fact does. []
   when the fact answers no question anyone would ask.
 """
+
+#: Names of the languages the writer can be told about. Any other entry of
+#: ``extraction.question_languages`` is passed on as written ("Dutch").
+LANGUAGE_NAMES = {"en": "English", "de": "German", "fr": "French", "es": "Spanish"}
+
+#: At most this many languages are asked for: a memory keeps 3 questions
+#: from one source (``QUESTIONS_PER_MEMORY``).
+LANGUAGES_LIMIT = 3
+
+
+def language_names(languages: list[str] | tuple[str, ...] | None) -> list[str]:
+    """``languages`` as the writer is told them: a known code as its name,
+    anything else as written, each once, at most ``LANGUAGES_LIMIT``."""
+    names: list[str] = []
+    for item in languages or []:
+        # no braces: the extraction prompt is formatted after this goes in
+        text = " ".join(str(item).replace("{", " ").replace("}", " ").split())
+        name = LANGUAGE_NAMES.get(text.casefold(), text)
+        if name and name.casefold() not in {n.casefold() for n in names}:
+            names.append(name)
+        if len(names) == LANGUAGES_LIMIT:
+            break
+    return names
+
+
+def language_instruction(languages: list[str] | tuple[str, ...] | None) -> str:
+    """The sentence the writer is given about the store's languages, "" for
+    none (the writer chooses). With one language, every question is in it;
+    with more, at least one question is in each. Names stay as written in
+    every language, since the search matches them by their words."""
+    names = language_names(languages)
+    if not names:
+        return ""
+    if len(names) == 1:
+        return (f"Write every question in {names[0]}. Keep the names of people, "
+                "things and places as written.")
+    listed = ", ".join(names[:-1]) + " and " + names[-1]
+    return (f"The conversations of this store are in {listed}. Write at least one "
+            "question in each of these languages. Keep the names of people, things "
+            "and places as written in every language.")
+
+
+def questions_rule(languages: list[str] | tuple[str, ...] | None = None) -> str:
+    """``QUESTIONS_RULE``, with the language instruction as its last line when
+    ``languages`` are given. Without them it is ``QUESTIONS_RULE`` byte for
+    byte, so the provider's prompt cache holds."""
+    extra = language_instruction(languages)
+    if not extra:
+        return QUESTIONS_RULE
+    return QUESTIONS_RULE + textwrap.fill(
+        extra, width=78, initial_indent="  ", subsequent_indent="  ") + "\n"
+
 
 #: The answer field, a list of strings.
 QUESTIONS_FIELD: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
@@ -116,13 +170,25 @@ BACKFILL_SCHEMA: dict[str, Any] = {
 }
 
 
-def write_questions(llm: Any, memories: list[str]) -> list[list[str]]:
+def backfill_system(languages: list[str] | tuple[str, ...] | None = None) -> str:
+    """``BACKFILL_SYSTEM``, with the language instruction after the rule when
+    ``languages`` are given."""
+    extra = language_instruction(languages)
+    if not extra:
+        return BACKFILL_SYSTEM
+    rule_end = "\n\nAnswer as JSON:"
+    return BACKFILL_SYSTEM.replace(rule_end, "\n" + textwrap.fill(extra, width=78) + rule_end, 1)
+
+
+def write_questions(llm: Any, memories: list[str],
+                    languages: list[str] | tuple[str, ...] | None = None) -> list[list[str]]:
     """The questions each of ``memories`` answers, asked in one call: one list
     per memory, in order, cleaned as every source is, [] where the model gave
     none or an answer that cannot be read. The memories are shown numbered
     from 1, and an item whose number names no memory is ignored. A failing
     call raises, so the caller can tell a batch it could not ask from one the
-    model found nothing in."""
+    model found nothing in. ``languages`` adds the language instruction
+    (``language_instruction``)."""
     out: list[list[str]] = [[] for _ in memories]
     if not memories:
         return out
@@ -133,7 +199,7 @@ def write_questions(llm: Any, memories: list[str]) -> list[list[str]]:
     listing = "\n".join(
         f"{n}. {' '.join(str(text or '').split())}" for n, text in enumerate(memories, 1))
     raw = llm.complete(
-        BACKFILL_SYSTEM,
+        backfill_system(languages),
         f"Memories:\n{listing}\n\nAnswer for every number as JSON.",
         json_schema=BACKFILL_SCHEMA,
     )
@@ -152,3 +218,60 @@ def write_questions(llm: Any, memories: list[str]) -> list[list[str]]:
             continue
         out[n - 1] = clean_questions(item.get("questions"), limit=QUESTIONS_PER_MEMORY)
     return out
+
+
+# ---------------------------------------------------------------- languages
+
+#: Short words frequent in each language and rare in the others: enough to
+#: tell German, English, French and Spanish turns apart without a library.
+#: "in" is in no list, since it is as frequent in German as in English.
+#: "was" is German only here: in a short German question it is often the
+#: only such word ("Was verkauft Brakadu Bakery?").
+_STOPWORDS: dict[str, frozenset[str]] = {
+    "en": frozenset("""the and is are were of to that it with for on this you
+        have has what where who which when how does did do not but be at from they
+        we my your his her their an or will would can there about""".split()),
+    "de": frozenset("""der die das und ist sind war waren nicht ein eine einen dem den
+        des mit für auf ich du er sie wir ihr was wo wer wann wie welche welcher
+        welches hat haben wird werden zu im auch noch bei aus nach über mein
+        dein sein kein oder aber dass""".split()),
+    "fr": frozenset("""le la les et est sont était un une des du de que qui dans pour
+        pas sur avec ce cette il elle nous vous ils je mon ma mes où quel quelle
+        quand comment aussi mais ou au aux""".split()),
+    "es": frozenset("""el la los las y es son era un una unos de del que en para por
+        con no se su sus lo como pero donde dónde cuál quién cuándo qué está están
+        yo tu mi muy también al""".split()),
+}
+_WORD = re.compile(r"[^\W\d_]+")
+
+
+def detect_language(text: str) -> str | None:
+    """The language of ``text`` among German, English, French and Spanish,
+    by the share of its words that are short frequent words of each. None
+    when no such word is in it, or when two languages tie."""
+    words = [w.casefold() for w in _WORD.findall(text or "")]
+    if not words:
+        return None
+    counts = {code: sum(w in stop for w in words) for code, stop in _STOPWORDS.items()}
+    best = max(counts.values())
+    if best == 0:
+        return None
+    leaders = [code for code, n in counts.items() if n == best]
+    return leaders[0] if len(leaders) == 1 else None
+
+
+def detect_languages(texts: list[str], *, min_share: float = 0.2,
+                     limit: int = LANGUAGES_LIMIT) -> list[str]:
+    """The languages of ``texts`` (saved turns), most frequent first: each
+    language of at least ``min_share`` of the texts whose language is read
+    (``detect_language``), at most ``limit``. [] when no text is read."""
+    counts: dict[str, int] = {}
+    for text in texts:
+        code = detect_language(text)
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    total = sum(counts.values())
+    if not total:
+        return []
+    ranked = sorted(counts, key=lambda code: (-counts[code], code))
+    return [code for code in ranked if counts[code] / total >= min_share][:limit]

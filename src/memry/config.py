@@ -206,6 +206,16 @@ class RetrievalConfig(BaseModel):
         return value
 
 
+class ExtractionConfig(BaseModel):
+    #: The languages the question writer is told the store's turns are in
+    #: (``retrieval.question_keys``): it writes at least one question in each,
+    #: so a person asking in either language matches a stored question by its
+    #: words. Codes ("en", "de", "fr", "es") or names, at most three. Empty
+    #: (the default): the writer chooses. "auto": the languages are read from
+    #: the namespace's saved turns (``MemoryStore.question_languages``).
+    question_languages: list[str] = Field(default_factory=list)
+
+
 class SupersedeConfig(BaseModel):
     """When a change or a correction may replace a stored memory without asking.
 
@@ -329,6 +339,7 @@ class Config(BaseModel):
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     decay: DecayConfig = Field(default_factory=DecayConfig)
     supersede: SupersedeConfig = Field(default_factory=SupersedeConfig)
     ann: AnnConfig = Field(default_factory=AnnConfig)
@@ -494,6 +505,9 @@ def _from_env() -> dict[str, Any]:
     put("supersede", "protect_sources", _int(e("MEMRY_SUPERSEDE_PROTECT_SOURCES")))
     put("supersede", "state_confidence", _float(e("MEMRY_SUPERSEDE_STATE_CONFIDENCE")))
     put("supersede", "confidence", _float(e("MEMRY_SUPERSEDE_CONFIDENCE")))
+
+    languages = [x.strip() for x in (e("MEMRY_QUESTION_LANGUAGES") or "").split(",")]
+    put("extraction", "question_languages", [x for x in languages if x] or None)
 
     put("embedding", "provider", e("MEMRY_EMBEDDING_PROVIDER"))
     put("embedding", "model", e("MEMRY_EMBEDDING_MODEL"))

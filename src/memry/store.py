@@ -123,7 +123,12 @@ from .intelligence.extraction import (
     verbatim_candidates,
     verify_coverage,
 )
-from .intelligence.questions import QUESTIONS_CHECKED_KEY, merge_questions, write_questions
+from .intelligence.questions import (
+    QUESTIONS_CHECKED_KEY,
+    detect_languages,
+    merge_questions,
+    write_questions,
+)
 from .intelligence.reconcile import (
     CONFLICT_KEY,
     UPDATE_SUPERSEDE_REASON,
@@ -763,6 +768,9 @@ class MemoryStore:
         # lost and every group was sent to the model twice.
         self._pass_locks: dict[tuple[str, str | None], threading.RLock] = {}
         self._pass_locks_guard = threading.Lock()
+        # The saved turns read for each namespace's languages ("auto" in
+        # ``extraction.question_languages``), with the time they were read.
+        self._turns_read: dict[str | None, tuple[float, list[str]]] = {}
         self.backend.names_changed = self._names_changed
         try:
             self._settle_owner_pairs()
@@ -925,6 +933,9 @@ class MemoryStore:
             identity=stated if stated is not None and self._owner_unnamed(scope.user_id)
             else None,
             questions=self.config.retrieval.question_keys,
+            question_languages=self.question_languages(
+                scope.user_id, [str(m.get("content") or "") for m in messages])
+            if self.config.retrieval.question_keys else None,
         )
         self._confirm_candidate_whens(candidates, now=now)
         return candidates
@@ -1236,6 +1247,39 @@ class MemoryStore:
             except Exception as exc:
                 log.warning("question keys not written on save: %s", exc)
 
+    #: "auto" languages: how many of a namespace's latest saved turns are
+    #: read, and for how many seconds that reading is kept.
+    LANGUAGE_TURNS = 200
+    LANGUAGE_TTL = 3600.0
+
+    def question_languages(self, user_id: str | None,
+                           said: list[str] | None = None) -> list[str]:
+        """The languages the question writer is told (``extraction.
+        question_languages``): the configured ones, as written. "auto" among
+        them adds the languages of the namespace's latest saved turns and of
+        ``said`` (the turns being saved), read by their frequent short words
+        (``questions.detect_languages``). The turns are read once an hour per
+        namespace: one query of ``LANGUAGE_TURNS`` rows, and the instruction
+        stays the same between saves, so the provider's prompt cache holds.
+        [] (the writer chooses) when nothing is configured."""
+        configured = [str(x).strip() for x in self.config.extraction.question_languages]
+        if not any(x.casefold() == "auto" for x in configured):
+            return [x for x in configured if x]
+        fixed = [x for x in configured if x and x.casefold() != "auto"]
+        read = self._turns_read.get(user_id)
+        if read is None or time.monotonic() - read[0] > self.LANGUAGE_TTL:
+            try:
+                turns = [e.content for e in self.backend.list_episodes(
+                    Scope(user_id=user_id), limit=self.LANGUAGE_TURNS)]
+            except Exception as exc:  # the writer then chooses, as without "auto"
+                log.warning("languages of the saved turns not read: %s", exc)
+                turns = []
+            read = (time.monotonic(), turns)
+            self._turns_read[user_id] = read
+        found = detect_languages(read[1] + list(said or []))
+        known = {x.casefold() for x in fixed}
+        return fixed + [code for code in found if code not in known]
+
     def _write_questions(self, memory_id: str, questions: list[str], source: str) -> None:
         """Keep ``questions`` as the memory's question keys, each embedded
         (cut to ``retrieval.property_dimensions``, as a property vector is)
@@ -1307,7 +1351,8 @@ class MemoryStore:
         without questions. A batch whose call fails is logged and skipped,
         never fatal: its memories stay due for the next run. It runs whether
         ``retrieval.question_keys`` is on or not, since an operator fills the
-        keys before turning the search on. ``dry_run`` asks the model but
+        keys before turning the search on. The writer is told the store's
+        languages (``question_languages``). ``dry_run`` asks the model but
         writes nothing and hands back what it would have written.
         """
         if not self.llm.available:
@@ -1317,13 +1362,14 @@ class MemoryStore:
         if limit is not None:
             pending = pending[: max(int(limit), 0)]
         size = max(int(batch), 1)
+        languages = self.question_languages(user_id)
         summary: dict[str, Any] = {"checked": 0, "written": 0}
         proposals: list[dict[str, Any]] = []
         failed = 0
         for index in range(0, len(pending), size):
             group = pending[index : index + size]
             try:
-                found = write_questions(self.llm, [m.content for m in group])
+                found = write_questions(self.llm, [m.content for m in group], languages)
             except Exception as exc:
                 failed += 1
                 log.warning("question backfill: a batch of %d not asked: %s", len(group), exc)

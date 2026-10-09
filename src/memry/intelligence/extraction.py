@@ -13,7 +13,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from .questions import QUESTIONS_FIELD, QUESTIONS_RULE, clean_questions
+from .questions import QUESTIONS_FIELD, clean_questions, questions_rule
 from ..models import MEMORY_TYPES, NAMED_ENTITY_TYPES, CandidateFact, clean_tags
 from ..providers.llm import LLM
 from .when import WHEN_FACT_SCHEMA, parse_when
@@ -219,17 +219,20 @@ _SHAPE_END_WITH_USER_NAME = (
     'Return {{"facts": [], "user_name": null}} if')
 
 
-def extraction_system(*, ask_user_name: bool = False, ask_questions: bool = False) -> str:
+def extraction_system(*, ask_user_name: bool = False, ask_questions: bool = False,
+                      question_languages: list[str] | None = None) -> str:
     """The extraction instructions, unformatted (``{today}`` still in them):
     ``EXTRACTION_SYSTEM`` as it is, or with the ``user_name`` rule placed
     after the last rule and the field added to the answer's shape, or with
     the ``questions`` rule (``questions.QUESTIONS_RULE``) placed before the
-    ``sources`` rule and the field in the shape. Each is a setting of the
-    store, not of a save, so the prompt stays the same from one save to the
-    next and the provider's prompt cache holds."""
+    ``sources`` rule and the field in the shape. ``question_languages`` adds
+    the store's languages to that rule (``questions.questions_rule``). Each
+    is a setting of the store, not of a save, so the prompt stays the same
+    from one save to the next and the provider's prompt cache holds."""
     text = EXTRACTION_SYSTEM
     if ask_questions:
-        text = (text.replace(_SOURCES_RULE, QUESTIONS_RULE + _SOURCES_RULE, 1)
+        rule = questions_rule(question_languages)
+        text = (text.replace(_SOURCES_RULE, rule + _SOURCES_RULE, 1)
                 .replace(_SHAPE_SOURCES, _SHAPE_QUESTIONS + _SHAPE_SOURCES, 1))
     if ask_user_name:
         rules_end = "\n\nRespond with JSON only:"
@@ -355,12 +358,15 @@ def extract_facts(
     entity_names: list[tuple[str, str | None]] | None = None,
     identity: list[str] | None = None,
     questions: bool = False,
+    question_languages: list[str] | None = None,
 ) -> list[CandidateFact]:
     """LLM extraction (phase 1). Raises if the LLM is unavailable.
 
     ``questions`` asks for the questions each fact answers as well
     (``questions.QUESTIONS_RULE``), kept on ``CandidateFact.questions``; the
-    store asks when ``retrieval.question_keys`` is on.
+    store asks when ``retrieval.question_keys`` is on. ``question_languages``
+    are the store's languages: at least one question is asked in each
+    (``questions.questions_rule``).
 
     ``identity``, when given, asks for the user's name as well and receives
     it when the conversation states it (``stated_user_name``): the user
@@ -466,7 +472,8 @@ def extract_facts(
     )
     ask_user_name = identity is not None
     raw = llm.complete(
-        extraction_system(ask_user_name=ask_user_name, ask_questions=questions)
+        extraction_system(ask_user_name=ask_user_name, ask_questions=questions,
+                          question_languages=question_languages)
         .format(today=now.date().isoformat()),
         f"Conversation:\n{transcript}{speaker_offer}{context_offer}{owner_offer}{entity_offer}"
         f"{offer}{hint_offer}"

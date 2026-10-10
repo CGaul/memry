@@ -51,8 +51,8 @@ Subcommands:
                 these splits.
 ``ask``         runs ``SCREEN_CRITERIA`` over every d1 name through the
                 configured decision provider and writes ``screen.json``. Needs
-                ``MEMRY_DECISION_PROVIDER=jev`` and an API key; everything else
-                here is offline.
+                ``MEMRY_DECISION_PROVIDER=jev`` (or ``openai``) and an API key;
+                everything else here is offline.
 
 Run:
     python evals/entity_structure_benchmark.py mechanical --data local/d
@@ -94,7 +94,7 @@ from memry.intelligence.structure import (  # noqa: E402
     NAMED_THING_MIN,
     is_hub,
 )
-from memry.providers.decisions import Choice, JevDecider, LLMDecider  # noqa: E402
+from memry.providers.decisions import Choice, JevDecider, LLMDecider, OpenAIDecider  # noqa: E402
 from memry.providers.llm import build_llm  # noqa: E402
 
 #: Reader labels, and the screen verdict that means the same thing. "event" has
@@ -326,6 +326,7 @@ def run_ask(names: dict[str, dict], out_path: pathlib.Path, workers: int) -> Non
     config = Config.load()
     llm = build_llm(config.llm)
     decider = (JevDecider(config.decision) if config.decision.provider == "jev"
+               else OpenAIDecider(config.decision) if config.decision.provider == "openai"
                else LLMDecider(llm))
     if not decider.available:
         sys.exit(f"decision provider {decider.name!r} is not available; set "

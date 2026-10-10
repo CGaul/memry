@@ -12,7 +12,7 @@ This module is the second kind. A :class:`Decider` answers typed questions -
 returns the selected answer plus the probability it assigned to every option.
 Several questions go in one call and are answered independently.
 
-Three implementations ship:
+Four implementations ship:
 
 ``NoneDecider``
     Abstains. Every answer comes back unavailable, which callers already know
@@ -26,6 +26,11 @@ Three implementations ship:
     TypeSafe's Jev, a System One model that answers typed questions directly.
     Off unless ``MEMRY_DECISION_PROVIDER=jev``.
 
+``OpenAIDecider``
+    OpenAI's Decisions API (gpt-6-luna), for comparison with Jev. Off unless
+    ``MEMRY_DECISION_PROVIDER=openai`` (or ``MEMRY_DECIDER=openai``). Not
+    measured, so not calibrated: it merges nothing on its own.
+
 Confidence means the same thing in all three: how concentrated the probability
 mass is. Callers gate on it (see ``AUTO_CONFIRM_CONFIDENCE``), so a provider
 that reports honest uncertainty is worth more here than one that is merely
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -503,12 +509,181 @@ class JevDecider(Decider):
         return Answers(out)
 
 
+#: OpenAI's Decisions API (public beta, October 2026): ``POST /v1/decisions``,
+#: gpt-6-luna only. A choice takes 2 to 255 options.
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_DECISIONS_MODEL = "gpt-6-luna"
+OPENAI_MIN_CHOICES, OPENAI_MAX_CHOICES = 2, 255
+
+
+class OpenAIDecider(Decider):
+    """OpenAI's Decisions API over HTTP, behind the same interface as Jev.
+
+    One POST carries every question, as with Jev. The state is the request's
+    ``input``; a :class:`Noul` is a ``predicate`` (a probability), a
+    :class:`Choice` a ``choice`` (the option, a probability per option and a
+    confidence) and a :class:`Score` a ``score`` (the probability-weighted
+    level, a probability per level). The answers come back in the shape
+    :class:`JevDecider` returns, so every call site reads them unchanged.
+
+    Nothing about this provider has been measured. The page makes no claim
+    about calibration, so it is not ``calibrated``, merges nothing on its own,
+    sets no reconcile bars and does not judge searches unless the relevance
+    mode asks for it (``retrieval.relational_relevance="jev"``). Each of those
+    waits for the comparison with Jev (PhD notes, decisions-vs-jev).
+    """
+
+    name = "openai"
+
+    def __init__(self, cfg: DecisionConfig, transport: httpx.BaseTransport | None = None) -> None:
+        self.cfg = cfg
+        if cfg.auto_confirm_confidence is not None:
+            self.auto_confirm_confidence = cfg.auto_confirm_confidence
+        self.model = cfg.model or OPENAI_DECISIONS_MODEL
+        self.served_model: str | None = None
+        self.base_url = (cfg.base_url or OPENAI_BASE_URL).rstrip("/")
+        key = cfg.api_key or os.environ.get("OPENAI_API_KEY") or ""
+        self.available = bool(key)
+        if not self.available:
+            log.warning(
+                "MEMRY_DECISION_PROVIDER=openai but no API key is set; decisions fall back "
+                "to the conservative path. Set MEMRY_DECISION_API_KEY or OPENAI_API_KEY."
+            )
+        self._client = httpx.Client(
+            timeout=cfg.timeout, transport=transport,
+            headers={"authorization": f"Bearer {key}", "content-type": "application/json"},
+        )
+        #: input tokens the API reported, summed over this decider's calls
+        self.input_tokens = 0
+
+    def close(self) -> None:
+        self._client.close()
+
+    def request_body(self, state: str, questions: dict[str, Question]) -> dict[str, Any]:
+        """The JSON this decider sends for these questions. A choice with fewer
+        than 2 or more than 255 options cannot be asked and is left out; its
+        answer comes back unavailable."""
+        return {
+            "model": self.model,
+            "input": state,
+            "questions": [self._question(key, q) for key, q in questions.items()
+                          if self.askable(q)],
+        }
+
+    @staticmethod
+    def askable(q: Question) -> bool:
+        if isinstance(q, Choice):
+            return OPENAI_MIN_CHOICES <= len(q.criteria) <= OPENAI_MAX_CHOICES
+        if isinstance(q, Score):
+            return len(q.levels) >= 2
+        return True
+
+    @staticmethod
+    def _question(key: str, q: Question) -> dict[str, Any]:
+        if isinstance(q, Choice):
+            return {"type": "choice", "name": key, "instructions": q.instructions,
+                    "choices": [{"value": option, "description": text}
+                                for option, text in q.criteria.items()]}
+        if isinstance(q, Score):
+            return {"type": "score", "name": key, "instructions": q.instructions,
+                    "levels": [{"label": level} for level in q.levels]}
+        return {"type": "predicate", "name": key, "instructions": q.instructions}
+
+    def decide(self, state: str, questions: dict[str, Question]) -> Answers:
+        if not self.available or not questions:
+            return _unavailable(questions)
+        body = self.request_body(state, questions)
+        if not body["questions"]:
+            return _unavailable(questions)
+        try:
+            resp = self._client.post(f"{self.base_url}/decisions", json=body)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            # A save must survive a decision provider being down or rate limited.
+            log.warning("openai decision call failed: %s", exc)
+            return _unavailable(questions)
+        if isinstance(payload, dict):
+            if isinstance(payload.get("model"), str):
+                self.served_model = payload["model"]
+            usage = payload.get("usage")
+            if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
+                self.input_tokens += usage["input_tokens"]
+        return self._parse(payload, questions)
+
+    @staticmethod
+    def _parse(payload: Any, questions: dict[str, Question]) -> Answers:
+        items = payload.get("answers") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return _unavailable(questions)
+        asked = [key for key, q in questions.items() if OpenAIDecider.askable(q)]
+        by_name: dict[str, Any] = {}
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            # answers come back in the order asked; the name is echoed when given
+            key = name if isinstance(name, str) else (asked[i] if i < len(asked) else None)
+            if key in questions and key not in by_name:
+                by_name[key] = item
+        out: dict[str, Answer] = {}
+        for key, q in questions.items():
+            item = by_name.get(key)
+            if not isinstance(item, dict) or item.get("type") == "refusal":
+                out[key] = Answer()
+                continue
+            if isinstance(q, Choice):
+                if item.get("type") != "choice":
+                    out[key] = Answer()
+                    continue
+                value = item.get("choice")
+                probs: dict[str, float] = {}
+                for entry in item.get("probabilities") or []:
+                    if isinstance(entry, dict) and isinstance(entry.get("value"), str):
+                        probs[entry["value"]] = _clamp(entry.get("probability"))
+                if not isinstance(value, str) or value not in q.criteria:
+                    out[key] = Answer()
+                    continue
+                conf = _clamp(item.get("confidence"), probs.get(value, 0.0))
+                out[key] = Answer(value, probs, conf, available=True)
+            elif isinstance(q, Score):
+                if item.get("type") != "score":
+                    out[key] = Answer()
+                    continue
+                try:
+                    score = float(item.get("score"))
+                except (TypeError, ValueError):
+                    out[key] = Answer()
+                    continue
+                if not 0.0 <= score <= len(q.levels) - 1:
+                    out[key] = Answer()
+                    continue
+                probs = {}
+                for entry in item.get("probabilities") or []:
+                    if isinstance(entry, dict) and isinstance(entry.get("value"), int):
+                        probs[str(entry["value"])] = _clamp(entry.get("probability"))
+                out[key] = Answer(score, probs, _clamp(item.get("confidence")), available=True)
+            else:
+                if item.get("type") != "predicate":
+                    out[key] = Answer()
+                    continue
+                truth = _clamp(item.get("probability"), -1.0)
+                if truth < 0.0:
+                    out[key] = Answer()
+                    continue
+                # As for a Jev noul: distance from 0.5 is the confidence.
+                out[key] = Answer(truth, {}, abs(truth - 0.5) * 2, available=True)
+        return Answers(out)
+
+
 def build_decider(cfg: DecisionConfig, llm: LLM) -> Decider:
     """Pick the decision provider. Memry treats an unset provider (a store built
     in code; a server does not start with one, see ``config.require_models``) as
     "none"."""
     if cfg.provider == "jev":
         decider: Decider = JevDecider(cfg)
+    elif cfg.provider == "openai":
+        decider = OpenAIDecider(cfg)
     elif cfg.provider in (None, "none"):
         decider = NoneDecider()
     else:

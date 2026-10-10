@@ -33,8 +33,9 @@ DEFAULT_DIR = Path.home() / ".memry"
 LLMProvider = Literal["anthropic", "openai", "ollama", "none"]
 EmbeddingProvider = Literal["openai", "ollama", "voyage", "hash", "none"]
 # "none" keeps the built-in prompt path; "llm" routes typed questions through
-# the configured text model; "jev" uses TypeSafe's System One model.
-DecisionProvider = Literal["none", "llm", "jev"]
+# the configured text model; "jev" uses TypeSafe's System One model; "openai"
+# uses OpenAI's Decisions API (gpt-6-luna), not measured against Jev yet.
+DecisionProvider = Literal["none", "llm", "jev", "openai"]
 
 #: The OpenAI default is gpt-6-luna, at half the price of gpt-5.6-luna. As the
 #: extraction model it matched gpt-5.6-luna on every measure (details kept,
@@ -419,6 +420,10 @@ def model_requirements(cfg: Config) -> list[str]:
         )
     elif cfg.decision.provider == "jev" and not cfg.decision.api_key:
         missing.append("MEMRY_DECISION_API_KEY: the TypeSafe key for MEMRY_DECISION_PROVIDER=jev")
+    elif (cfg.decision.provider == "openai" and not cfg.decision.api_key
+          and not os.environ.get("OPENAI_API_KEY")):
+        missing.append("MEMRY_DECISION_API_KEY or OPENAI_API_KEY: the OpenAI key for "
+                       "MEMRY_DECISION_PROVIDER=openai")
     return missing
 
 
@@ -442,6 +447,12 @@ def require_models(cfg: Config) -> None:
             "MEMRY_DECISION_PROVIDER=jev, Memry merges duplicates on its own.",
             cfg.decision.provider,
         )
+    if cfg.decision.provider == "openai":
+        logging.getLogger("memry").warning(
+            "MEMRY_DECISION_PROVIDER=openai: Memry sends its decision questions to OpenAI's "
+            "Decisions API. Its probabilities have not been measured against labelled "
+            "answers, so Memry merges entities only by fixed rules; you confirm the other "
+            "merges under Upkeep.")
 
 
 def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -512,7 +523,8 @@ def _from_env() -> dict[str, Any]:
     put("llm", "base_url", e("MEMRY_LLM_BASE_URL"))
     put("llm", "effort", e("MEMRY_LLM_EFFORT"))
 
-    put("decision", "provider", e("MEMRY_DECISION_PROVIDER"))
+    # MEMRY_DECIDER is a short name for it; MEMRY_DECISION_PROVIDER wins when both are set.
+    put("decision", "provider", e("MEMRY_DECISION_PROVIDER") or e("MEMRY_DECIDER"))
     put("decision", "model", e("MEMRY_DECISION_MODEL"))
     put("decision", "api_key", e("MEMRY_DECISION_API_KEY"))
     put("decision", "base_url", e("MEMRY_DECISION_BASE_URL"))

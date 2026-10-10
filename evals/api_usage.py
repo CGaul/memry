@@ -25,7 +25,12 @@ prices come from the caller as a function (``price``) of a model and its
 input, cached and output tokens. A call is refused in the same way once the
 ledger's spend is ``max_usd`` or more. The tokens of a model without a price
 are not in the spend. A call still in flight has no tokens in the ledger
-yet, so the spend can end above the cap by the calls in flight.
+yet, so the spend can end above the cap by the calls in flight. Each meter
+keeps the spend as a running total. Its first check reads the whole ledger,
+so the earlier segments of a resumed run are in the total. A later check
+reads only the rows after the highest id read before, and the rows whose
+call was still in flight at an earlier check. A row is priced once, when its
+call has finished.
 """
 
 from __future__ import annotations
@@ -214,6 +219,9 @@ class UsageMeter:
         self.max_usd = max_usd
         self.price = price
         self.capped: str | None = None
+        self._usd = 0.0  # the running total of the rows priced
+        self._read_to = 0  # the highest row id read
+        self._in_flight: set[int] = set()  # rows read before their call finished
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, timeout=_BUSY_SECONDS, isolation_level=None,
                                    check_same_thread=False)
@@ -255,10 +263,23 @@ class UsageMeter:
                                     (group,)).fetchone()[0]
 
     def _spent(self) -> float:
-        """The dollars of the whole ledger at ``price``."""
-        rows = self._db.execute("SELECT model, sum(input_tokens), sum(cached_tokens), "
-                                "sum(output_tokens) FROM calls GROUP BY model").fetchall()
-        return sum(self.price(*row) or 0.0 for row in rows)  # type: ignore[misc]
+        """The dollars of the whole ledger at ``price``: the running total
+        plus the rows after ``_read_to`` and the rows in ``_in_flight`` whose
+        call has finished (``seconds`` is written), each priced once."""
+        waiting = sorted(self._in_flight)
+        rows = self._db.execute(
+            "SELECT id, model, input_tokens, cached_tokens, output_tokens, seconds FROM calls "
+            "WHERE id > ?" + (f" OR id IN ({','.join('?' * len(waiting))})" if waiting else ""),
+            (self._read_to, *waiting)).fetchall()
+        for row_id, model, input_tokens, cached_tokens, output_tokens, seconds in rows:
+            self._read_to = max(self._read_to, row_id)
+            if seconds is None:
+                self._in_flight.add(row_id)
+                continue
+            self._in_flight.discard(row_id)
+            self._usd += self.price(model, input_tokens, cached_tokens,  # type: ignore[misc]
+                                    output_tokens) or 0.0
+        return self._usd
 
     def _reserve(self, row: dict[str, Any]) -> int:
         """The call's row, written before it is sent, inside the caps."""

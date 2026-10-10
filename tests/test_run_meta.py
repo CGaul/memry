@@ -382,3 +382,45 @@ def test_the_dollar_cap_needs_a_ledger_and_a_number_from_0():
             xb.parse_args(["--dataset", "locomo", *argv])
     assert xb.parse_args(["--dataset", "locomo", "--usage-db", "u", "--max-usd", "25"]
                          ).max_usd == 25.0
+
+
+def test_each_check_prices_only_the_new_rows_and_the_calls_finished_since(tmp_path):
+    """The meter keeps a running total. Its first check reads the earlier
+    segment (three rows, and a fourth whose call is still in flight in
+    another process). A later check prices the rows after the highest id
+    read before, and the in-flight row once its call has finished. No row
+    is priced twice."""
+    ledger = tmp_path / "usage.sqlite"
+    with api_usage.UsageMeter(str(ledger)):
+        pass  # the ledger's table
+    db = sqlite3.connect(ledger)
+    db.executemany("INSERT INTO calls (grp, model, input_tokens, seconds) VALUES "
+                   "('chat', 'm', ?, ?)", [(100, 0.5), (200, 0.5), (300, 0.5), (None, None)])
+    db.commit()
+    priced: list[int] = []
+
+    def price(model, input_tokens, cached_tokens, output_tokens):
+        priced.append(input_tokens)
+        return input_tokens / 1e6  # one dollar per million input tokens
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1000, "completion_tokens": 1}})
+
+    client = httpx.Client(transport=httpx.MockTransport(reply))
+    url = "https://api.openai.com/v1/chat/completions"
+    with api_usage.UsageMeter(str(ledger), max_usd=0.0036, price=price) as meter:
+        client.post(url, json={"model": "m"})  # check 1: rows 1 to 4, row 4 in flight
+        assert priced == [100, 200, 300]
+        db.execute("UPDATE calls SET input_tokens = 50, seconds = 1.0 WHERE id = 4")
+        db.commit()  # the other process's call has finished
+        client.post(url, json={"model": "m"})  # check 2: row 5 (call 1) and row 4
+        assert sorted(priced[3:]) == [50, 1000]
+        client.post(url, json={"model": "m"})  # check 3: row 6 (call 2) alone
+        assert priced[5:] == [1000]
+        with pytest.raises(api_usage.CapReached, match=r"usd: \$0\.003650 spent, cap \$0\.0036"):
+            client.post(url, json={"model": "m"})  # check 4: row 7 (call 3) alone
+        assert priced[6:] == [1000] and meter.capped == "usd" and meter.calls() == 7
+    client.close()
+    db.close()
+    with pytest.raises(ValueError):
+        api_usage.UsageMeter(str(ledger), max_usd=1.0)  # a dollar cap without prices

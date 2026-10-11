@@ -1620,3 +1620,12 @@ def test_ledgers_opened_at_the_same_moment_all_open(tmp_path):
             assert meter._db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
             meter.close()
     assert failures == []
+
+
+def test_a_benchmark_run_skips_the_coverage_audit_unless_asked(monkeypatch):
+    from evals import external_benchmarks as eb
+    monkeypatch.delenv("MEMRY_COVERAGE_AUDIT", raising=False)
+    args = eb.parse_args(["--dataset", "locomo"])
+    assert args.coverage_audit is False
+    assert "coverage_audit" not in eb.run_options(args)  # a resumed run reuses its parts
+    assert eb.parse_args(["--dataset", "locomo", "--coverage-audit"]).coverage_audit is True

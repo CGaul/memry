@@ -19,6 +19,18 @@ group's cap is refused before it is sent: ``CapReached`` is raised. It is a
 ``BaseException``, so the ``except Exception`` a store uses to carry on after
 a failed provider call (a failed extraction is stored verbatim) does not
 swallow it, and the run stops where it is.
+
+A dollar cap (``max_usd``) is the most dollars over the whole ledger. The
+prices come from the caller as a function (``price``) of a model and its
+input, cached and output tokens. A call is refused in the same way once the
+ledger's spend is ``max_usd`` or more. The tokens of a model without a price
+are not in the spend. A call still in flight has no tokens in the ledger
+yet, so the spend can end above the cap by the calls in flight. Each meter
+keeps the spend as a running total. Its first check reads the whole ledger,
+so the earlier segments of a resumed run are in the total. A later check
+reads only the rows after the highest id read before, and the rows whose
+call was still in flight at an earlier check. A row is priced once, when its
+call has finished.
 """
 
 from __future__ import annotations
@@ -186,17 +198,30 @@ class UsageMeter:
 
     ``label`` names this process's share of the run (a conversation);
     ``caps`` maps a group to its most calls over the whole ledger;
+    ``max_usd`` is the most dollars over the whole ledger, at
+    ``price(model, input_tokens, cached_tokens, output_tokens)`` (USD, None
+    for a model without a price);
     ``refine(stage, group, body)`` may name a finer stage from the request
     body (which prompt a chat call carries), or return None to keep ``stage``.
     """
 
     def __init__(self, path: str, *, label: str = "", caps: dict[str, int] | None = None,
-                 refine: Callable[[str, str, Any], str | None] | None = None) -> None:
+                 refine: Callable[[str, str, Any], str | None] | None = None,
+                 max_usd: float | None = None,
+                 price: Callable[[str | None, int | None, int | None, int | None],
+                                 float | None] | None = None) -> None:
+        if max_usd is not None and price is None:
+            raise ValueError("max_usd needs price")
         self.path = str(path)
         self.label = label
         self.caps = dict(caps or {})
         self.refine = refine
+        self.max_usd = max_usd
+        self.price = price
         self.capped: str | None = None
+        self._usd = 0.0  # the running total of the rows priced
+        self._read_to = 0  # the highest row id read
+        self._in_flight: set[int] = set()  # rows read before their call finished
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, timeout=_BUSY_SECONDS, isolation_level=None,
                                    check_same_thread=False)
@@ -237,10 +262,36 @@ class UsageMeter:
             return self._db.execute("SELECT count(*) FROM calls WHERE grp = ?",
                                     (group,)).fetchone()[0]
 
+    def _spent(self) -> float:
+        """The dollars of the whole ledger at ``price``: the running total
+        plus the rows after ``_read_to`` and the rows in ``_in_flight`` whose
+        call has finished (``seconds`` is written), each priced once."""
+        waiting = sorted(self._in_flight)
+        rows = self._db.execute(
+            "SELECT id, model, input_tokens, cached_tokens, output_tokens, seconds FROM calls "
+            "WHERE id > ?" + (f" OR id IN ({','.join('?' * len(waiting))})" if waiting else ""),
+            (self._read_to, *waiting)).fetchall()
+        for row_id, model, input_tokens, cached_tokens, output_tokens, seconds in rows:
+            self._read_to = max(self._read_to, row_id)
+            if seconds is None:
+                self._in_flight.add(row_id)
+                continue
+            self._in_flight.discard(row_id)
+            self._usd += self.price(model, input_tokens, cached_tokens,  # type: ignore[misc]
+                                    output_tokens) or 0.0
+        return self._usd
+
     def _reserve(self, row: dict[str, Any]) -> int:
-        """The call's row, written before it is sent, inside the cap."""
+        """The call's row, written before it is sent, inside the caps."""
         cap = self.caps.get(row["grp"])
         with self._lock:
+            if self.max_usd is not None:
+                # a call's tokens are written when it finishes, never here, so
+                # the spend is read before the ledger is locked for writing
+                spent = self._spent()
+                if spent >= self.max_usd:
+                    self.capped = "usd"
+                    raise CapReached(f"usd: ${spent:.6f} spent, cap ${self.max_usd:g}")
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 if cap is not None:

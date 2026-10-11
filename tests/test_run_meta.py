@@ -137,7 +137,8 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
         "evidence_tokens", "evidence_tokens_in_stores", "compare_evidence_tokens",
         "answer_models", "answer_prompt", "judge", "judge_runs", "audit", "full_context",
         "context", "when", "descriptions", "question_keys", "question_keys_in_stores",
-        "entity_questions_in_stores", "workers", "jobs", "max_calls"}
+        "entity_questions_in_stores", "workers", "jobs", "max_calls", "max_usd",
+        "coverage_audit"}
     assert (config["ingest"], config["embedder"], config["text_model"]) == (
         "verbatim", "hash:v1-256", None)
     assert (config["decider"], config["k"], config["ks"], config["judge_runs"]) == (
@@ -270,3 +271,157 @@ def test_the_ledger_names_the_served_model_and_an_older_ledger_gets_the_column(t
 def test_the_metadata_file_sits_beside_the_results():
     assert xb.meta_path("runs/locomo_full.json") == Path("runs/locomo_full.meta.json")
     assert xb.meta_path("runs/locomo.out") == Path("runs/locomo.out.meta.json")
+
+
+# --------------------------------------------------------------------------
+# the dollar cap (--max-usd): the ledger's spend at the prices of --prices
+
+#: what one call of each stub costs at PRICES: (800 x 0.15 + 200 x 0.075 +
+#: 10 x 0.60) / 1e6 and (800 x 0.10 + 50 x 0.50) / 1e6. A question has one
+#: call of each, the answer first.
+MINI, LUNA = 0.000141, 0.000105
+
+
+def _spend(tmp_path) -> float:
+    return xb.ledger_usage(tmp_path / "usage.sqlite", PRICES)["usd"]["total"]
+
+
+def test_a_run_stops_before_the_call_once_the_spend_is_at_the_dollar_cap(
+        tmp_path, monkeypatch, no_models, stub_models):
+    code, out = _run(tmp_path, monkeypatch, "--max-usd", "0.0005")
+    assert code == 0
+    # the spend before each call: 0, MINI, MINI+LUNA, 2 MINI+LUNA, 2 MINI+2 LUNA (0.000492,
+    # under the cap); the sixth call would start at 0.000633 and is not sent
+    assert [model for _, model in stub_models] == ["gpt-4o-mini", "gpt-6-luna"] * 2 + [
+        "gpt-4o-mini"]
+    assert 2 * MINI + 2 * LUNA < 0.0005 <= _spend(tmp_path) == pytest.approx(3 * MINI + 2 * LUNA)
+    result = json.loads(out.read_text())
+    meta = json.loads((tmp_path / "run.meta.json").read_text())
+    assert result["complete"] is False and meta["results"]["complete"] is False
+    assert result["stopped"] == "conv-mini-1: usd: $0.000633 spent, cap $0.0005"
+    assert meta["config"]["max_usd"] == 0.0005 and meta["usage"]["calls"]["all"] == 5
+    assert meta["usage"]["usd"]["total"] == pytest.approx(_spend(tmp_path))
+
+
+def test_a_run_under_the_dollar_cap_is_unchanged(tmp_path, monkeypatch, no_models, stub_models):
+    runs = {}
+    for name, extra in (("free", ()), ("capped", ("--max-usd", "0.0015"))):
+        (tmp_path / name).mkdir()
+        code, out = _run(tmp_path / name, monkeypatch, *extra)
+        assert code == 0
+        result = json.loads(out.read_text())
+        overall = {key: value for key, value in result["tables"]["overall"].items()
+                   if not key.endswith(("_ms", "_seconds"))}  # times differ from run to run
+        runs[name] = (result["complete"], result["stopped"], overall,
+                      [(r["qid"], r["prediction"], r["judge"]) for r in result["rows"]],
+                      _spend(tmp_path / name))
+    assert runs["capped"] == runs["free"]
+    assert runs["free"][0] is True and len(stub_models) == 24
+    assert runs["free"][-1] == pytest.approx(6 * MINI + 6 * LUNA)  # 0.001476, under 0.0015
+
+
+def test_a_resumed_run_counts_the_spend_of_its_earlier_segments(
+        tmp_path, monkeypatch, no_models, stub_models):
+    parts = ("--results-dir", str(tmp_path / "parts"))
+    # segment 1: conv-mini-1 (three questions, 0.000738) is complete; conv-mini-2 stops
+    # before its fourth call, when the ledger is at 0.001125
+    assert _run(tmp_path, monkeypatch, *parts, "--max-usd", "0.001")[0] == 0
+    assert len(stub_models) == 9 and _spend(tmp_path) == pytest.approx(5 * MINI + 4 * LUNA)
+    first = json.loads((tmp_path / "parts" / "conv-mini-1.json").read_text())
+    assert first["complete"]
+    assert not json.loads((tmp_path / "parts" / "conv-mini-2.json").read_text())["complete"]
+    # segment 2, the same cap: conv-mini-1 is reused, and conv-mini-2 gets no call, since
+    # the ledger's spend from segment 1 is already at the cap
+    code, out = _run(tmp_path, monkeypatch, *parts, "--max-usd", "0.001")
+    assert code == 0 and len(stub_models) == 9
+    assert json.loads(out.read_text())["stopped"] == "conv-mini-2: usd: $0.001125 spent, cap $0.001"
+    assert json.loads((tmp_path / "parts" / "conv-mini-1.json").read_text()) == first
+    # segment 3, a cap above the whole spend: conv-mini-2 runs again in full
+    code, out = _run(tmp_path, monkeypatch, *parts, "--max-usd", "0.002")
+    assert code == 0 and len(stub_models) == 15 and json.loads(out.read_text())["complete"]
+    meta = json.loads((tmp_path / "run.meta.json").read_text())
+    assert meta["usage"]["calls"]["all"] == 15
+    assert meta["usage"]["usd"]["total"] == pytest.approx(8 * MINI + 7 * LUNA)
+
+
+def test_the_dollar_cap_prices_an_earlier_segment_as_the_metadata_does(
+        tmp_path, monkeypatch, no_models, stub_models):
+    """An earlier segment written into the ledger: Jev with 1M input and 2M
+    output tokens ($0.042, input tokens only) and gpt-4o-mini with 1M input
+    tokens, all cached ($0.075 at the cached price). Its $0.117 leaves
+    $0.0005 under a cap of $0.1175, so the run stops as the first test's
+    run does. Jev's output priced, or the cached tokens at the input price,
+    would put the ledger over the cap before the first call."""
+    ledger = tmp_path / "usage.sqlite"
+    with api_usage.UsageMeter(str(ledger)):
+        pass  # the ledger's table
+    db = sqlite3.connect(ledger)
+    db.execute("INSERT INTO calls (grp, host, model, stage, started, seconds, ok, input_tokens, "
+               "output_tokens, cached_tokens) VALUES ('jev', 'api.typesafe.ai', 'jev-latest', "
+               "'ingest:jev:reconcile', 1.0, 0.5, 1, 1000000, 2000000, NULL), ('chat', "
+               "'api.openai.com', 'gpt-4o-mini', 'ingest:extraction', 2.0, 0.5, 1, 1000000, 0, "
+               "1000000)")
+    db.commit()
+    db.close()
+    prices = {"models": {**PRICES["models"], "jev": {"input": 0.042}},
+              "aliases": {**PRICES["aliases"], "jev-latest": "jev"}}
+    (tmp_path / "jev-prices.json").write_text(json.dumps(prices))
+    code, out = _run(tmp_path, monkeypatch, "--prices", str(tmp_path / "jev-prices.json"),
+                     "--max-usd", "0.1175")
+    assert code == 0 and len(stub_models) == 5
+    meta = json.loads((tmp_path / "run.meta.json").read_text())
+    assert meta["usage"]["usd"] == {"jev": pytest.approx(0.042),
+                                    "openai": pytest.approx(0.075 + 3 * MINI + 2 * LUNA),
+                                    "total": pytest.approx(0.117 + 3 * MINI + 2 * LUNA)}
+    assert json.loads(out.read_text())["stopped"].startswith("conv-mini-1: usd: $0.117633")
+
+
+def test_the_dollar_cap_needs_a_ledger_and_a_number_from_0():
+    for argv in (["--max-usd", "1"], ["--usage-db", "u", "--max-usd", "-1"],
+                 ["--usage-db", "u", "--max-usd", "nan"]):
+        with pytest.raises(SystemExit):
+            xb.parse_args(["--dataset", "locomo", *argv])
+    assert xb.parse_args(["--dataset", "locomo", "--usage-db", "u", "--max-usd", "25"]
+                         ).max_usd == 25.0
+
+
+def test_each_check_prices_only_the_new_rows_and_the_calls_finished_since(tmp_path):
+    """The meter keeps a running total. Its first check reads the earlier
+    segment (three rows, and a fourth whose call is still in flight in
+    another process). A later check prices the rows after the highest id
+    read before, and the in-flight row once its call has finished. No row
+    is priced twice."""
+    ledger = tmp_path / "usage.sqlite"
+    with api_usage.UsageMeter(str(ledger)):
+        pass  # the ledger's table
+    db = sqlite3.connect(ledger)
+    db.executemany("INSERT INTO calls (grp, model, input_tokens, seconds) VALUES "
+                   "('chat', 'm', ?, ?)", [(100, 0.5), (200, 0.5), (300, 0.5), (None, None)])
+    db.commit()
+    priced: list[int] = []
+
+    def price(model, input_tokens, cached_tokens, output_tokens):
+        priced.append(input_tokens)
+        return input_tokens / 1e6  # one dollar per million input tokens
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1000, "completion_tokens": 1}})
+
+    client = httpx.Client(transport=httpx.MockTransport(reply))
+    url = "https://api.openai.com/v1/chat/completions"
+    with api_usage.UsageMeter(str(ledger), max_usd=0.0036, price=price) as meter:
+        client.post(url, json={"model": "m"})  # check 1: rows 1 to 4, row 4 in flight
+        assert priced == [100, 200, 300]
+        db.execute("UPDATE calls SET input_tokens = 50, seconds = 1.0 WHERE id = 4")
+        db.commit()  # the other process's call has finished
+        client.post(url, json={"model": "m"})  # check 2: row 5 (call 1) and row 4
+        assert sorted(priced[3:]) == [50, 1000]
+        client.post(url, json={"model": "m"})  # check 3: row 6 (call 2) alone
+        assert priced[5:] == [1000]
+        with pytest.raises(api_usage.CapReached, match=r"usd: \$0\.003650 spent, cap \$0\.0036"):
+            client.post(url, json={"model": "m"})  # check 4: row 7 (call 3) alone
+        assert priced[6:] == [1000] and meter.capped == "usd" and meter.calls() == 7
+    client.close()
+    db.close()
+    with pytest.raises(ValueError):
+        api_usage.UsageMeter(str(ledger), max_usd=1.0)  # a dollar cap without prices

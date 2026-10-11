@@ -123,9 +123,15 @@ again, so an interrupted run resumes where it stopped.
 ledger the processes share (``evals/api_usage.py``): the tokens each
 response reports, per stage (extraction, reconcile, audit, search, answer,
 judge, ...) and conversation. --max-calls GROUP=N stops the run before a
-call that would pass N calls of that group (chat, embeddings, jev). The
-harness tries a failed call again (a timeout, a rate limit, a server
-error), up to four calls in all; every try is counted.
+call that would pass N calls of that group (chat, embeddings, jev).
+With --max-usd X the run stops in the same way before a call when the
+ledger's spend is X dollars or more. The spend is priced as the dollars of
+<out>.meta.json are (``price_of``, ``dollars``, at the prices of --prices).
+It is the whole ledger's spend, so a resumed run's earlier segments are in
+it. A call still in flight has no tokens in the ledger yet, so the spend can
+end above X by the calls in flight. The harness tries a failed call again (a
+timeout, a rate limit, a server error), up to four calls in all; every try
+is counted.
 
 Every run writes beside its results file (x.json) a metadata file
 (x.meta.json, ``run_meta``) and prints the same as the first lines of its
@@ -1934,6 +1940,7 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
         if question_keys in ("on", "both"):
             store.config.retrieval.question_keys = True
         entry["question_keys"] = store.config.retrieval.question_keys
+        entry["coverage_audit"] = store.config.llm.coverage_audit
         entry["decider"] = store.decider.name
         entry["decider_model"] = getattr(store.decider, "model", None)
         entry["text_model"] = getattr(store.llm, "model", None) if store.llm.available else None
@@ -2359,6 +2366,8 @@ def run_meta(result: dict[str, Any], args: argparse.Namespace, *, argv: list[str
             "question_keys_in_stores": _seen(stores, "question_keys"),
             "entity_questions_in_stores": _seen(stores, "entity_questions"),
             "workers": args.workers, "jobs": args.jobs, "max_calls": args.caps or None,
+            "max_usd": args.max_usd,
+            "coverage_audit": args.coverage_audit,
         },
         "command": ["python", "-m", "evals.external_benchmarks", *argv],
         "time": {"started": _iso(started), "finished": _iso(finished),
@@ -2543,6 +2552,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="what decides at question time: the store's provider (store, "
                              "the default), none, or Jev (TYPESAFE_API_KEY); given several "
                              "times, every question is asked once per value")
+    parser.add_argument("--coverage-audit", action="store_true",
+                        help="run the second pass after each save (llm.coverage_audit). It only writes a warning for the saving agent and changes no answer, so a benchmark skips it unless this is given")
     parser.add_argument("--question-keys", choices=["config", "on", "both"], default="config",
                         help="question keys (retrieval.question_keys): on writes them at "
                              "ingest and reads them; both also asks every pass a second "
@@ -2562,6 +2573,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-calls", action="append", default=None, metavar="GROUP=N",
                         help="stop before the call that would pass N calls of GROUP "
                              "(chat, embeddings, jev, other) in the ledger; needs --usage-db")
+    parser.add_argument("--max-usd", type=float, default=None, metavar="X",
+                        help="stop before a call when the whole ledger's spend at the prices "
+                             "of --prices is X dollars or more (with the earlier segments of "
+                             "a resumed run); needs --usage-db")
     parser.add_argument("--prices", default=str(PRICES), metavar="PATH",
                         help="USD per million tokens per model, for the dollars in "
                              "<out>.meta.json (default: evals/prices.json)")
@@ -2573,6 +2588,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--jobs needs --results-dir")
     if args.max_calls and not args.usage_db:
         parser.error("--max-calls needs --usage-db")
+    if args.max_usd is not None and not args.usage_db:
+        parser.error("--max-usd needs --usage-db")
+    if args.max_usd is not None and not args.max_usd >= 0:
+        parser.error("--max-usd: a number of dollars from 0")
     try:
         args.caps = parse_caps(args.max_calls)
         args.k_list = sorted({int(x) for x in args.ks.split(",") if x.strip()} | {args.k}) \
@@ -2697,9 +2716,10 @@ def _write_json(path: pathlib.Path, data: Any) -> None:
 
 #: Options that do not change a conversation's results: a per-conversation
 #: file written under other values of these is still reused.
-_RUN_ONLY = ("jobs", "results_dir", "out", "worker", "usage_db", "max_calls", "caps", "prices",
-             "conversation", "limit", "seed", "sample", "workers", "store_dir", "export_mem0",
-             "export_longmemeval", "k_list", "category_set")
+_RUN_ONLY = ("jobs", "results_dir", "out", "worker", "usage_db", "max_calls", "caps", "max_usd",
+             "coverage_audit",
+             "prices", "conversation", "limit", "seed", "sample", "workers", "store_dir",
+             "export_mem0", "export_longmemeval", "k_list", "category_set")
 
 
 def run_options(args: argparse.Namespace) -> dict[str, Any]:
@@ -2767,6 +2787,9 @@ def write_selected(dataset: str, path: pathlib.Path, conversations: list[Convers
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    if not args.coverage_audit:
+        # no agent reads the second pass's warning here; worker processes inherit this
+        os.environ["MEMRY_COVERAGE_AUDIT"] = "0"
     started = time.time()
     try:
         prices = load_prices(args.prices)
@@ -2827,8 +2850,11 @@ def main(argv: list[str] | None = None) -> int:
             todo = []
     else:
         todo = conversations
-    meter = api_usage.UsageMeter(args.usage_db, label=args.worker or "", caps=args.caps,
-                                 refine=memry_stage).install() if args.usage_db and todo else None
+    meter = api_usage.UsageMeter(
+        args.usage_db, label=args.worker or "", caps=args.caps, refine=memry_stage,
+        max_usd=args.max_usd,
+        price=lambda model, *tokens: dollars(price_of(model, prices)[1], *tokens),
+    ).install() if args.usage_db and todo else None
     answer_llm = compare_answer_llm = embedder = None
     try:
         if todo:

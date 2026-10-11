@@ -947,7 +947,9 @@ entity or date filter, whether its question names anything, and with `relational
    those judged at `retrieval.turn_search_keep` (0.5) are taken, the best first, within
    `retrieval.turn_search_tokens` (400). `reconstruct_context` shows their turns after the
    evidence under a heading of their own, dated as the evidence is, and reserves their
-   share of the budget first; a filtered context runs none. The search rows carry none.
+   share of the budget first; a filtered context runs none. The MCP `search_memories`
+   rows carry them as "excerpts" on the first row, written as the evidence is
+   (`search_filtered` with `excerpts`), except for a filtered search.
    Memry also runs it in two more cases, both read from the judge's first call
    (`MemoryStore.turn_search_reasons`):
 
@@ -972,12 +974,16 @@ hold (`valid_from`, since taking it out of use moved its `updated_at`), and held
 day the memory that replaced it was said, written as that memory's "said" date is. The
 memories are followed by their evidence turns in the order they were said, each "<said
 date>: <speaker>: <text>", the speaker being the message's `name` when it gave one, else
-its role (an episode saved before names were kept shows its role). The role still decides
+its role (an episode saved before names were kept shows its role). Turn search's turns
+come last, written the same way. The role still decides
 what a role decides, such as whether "the user" is the owner. The MCP `search_memories` rows carry the same as data: `said`,
-`happened`, `invalid_at` for a memory out of use, and `evidence` (said, speaker, text). The
-benchmark runner passes these lines, the descriptions first, as Mem0's memory list
-(`evals/mem0_judge.py` renders nothing of its own); `--no-descriptions` leaves the
-descriptions out, for an ablation.
+`happened`, `invalid_at` for a memory out of use, and `evidence` (said, speaker, text);
+the first row also has `excerpts` when turn search ran. The benchmark runner answers each
+question from the context an agent gets: `MemoryStore.context_from`, the steps of
+`reconstruct_context` after its search, applied to the runner's one search at its k and
+token budget. It passes that context's lines, the descriptions first, as the memory list
+of its answer prompt (`evals/mem0_judge.py` renders nothing of its own);
+`--no-descriptions` leaves the descriptions out, for an ablation.
 
 Every ranked read breaks a tie by memory id (`ORDER BY updated_at DESC, id` and the like),
 so memories of one time (a bulk import, a restore) rank alike in every build of a store.

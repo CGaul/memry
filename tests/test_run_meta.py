@@ -136,9 +136,9 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
         "decider_in_stores", "decider_model", "search_deciders", "k", "ks", "depth",
         "evidence_tokens", "evidence_tokens_in_stores", "compare_evidence_tokens",
         "answer_models", "answer_prompt", "judge", "judge_runs", "audit", "full_context",
-        "context", "when", "descriptions", "question_keys", "question_keys_in_stores",
-        "entity_questions_in_stores", "workers", "jobs", "max_calls", "max_usd",
-        "coverage_audit"}
+        "context", "context_tokens", "when", "descriptions", "question_keys",
+        "question_keys_in_stores", "entity_questions_in_stores", "turn_search_in_stores",
+        "workers", "jobs", "max_calls", "max_usd", "coverage_audit"}
     assert (config["ingest"], config["embedder"], config["text_model"]) == (
         "verbatim", "hash:v1-256", None)
     assert (config["decider"], config["k"], config["ks"], config["judge_runs"]) == (
@@ -148,6 +148,10 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
     assert config["judge"] == "evals.external_benchmarks:containment_judge"
     assert config["question_keys"] == "config" and config["audit"] is None
     assert config["evidence_tokens_in_stores"] == 600
+    # every answer's context is the product's, at the runner's budget, turn search on
+    assert config["context_tokens"] == xb.CONTEXT_TOKENS == 4000
+    assert config["turn_search_in_stores"] == {"on": True, "bar": 0.8, "several": 0.5,
+                                               "complete": 0.7, "keep": 0.5, "tokens": 400}
     # the results file names the store's decider option, not the pass's provider
     assert result["config"]["decider"] == "config"
 
@@ -198,6 +202,8 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
     lines = xb.meta_lines(meta)
     assert printed[:len(lines)] == lines
     assert lines[0].startswith("## run: locomo, 6 questions scored of 6 asked")
+    assert any("turn search on (bar 0.8, several 0.5, complete 0.7), context tokens 4000"
+               in line for line in lines)
     assert any("gpt-4o-mini: 6 calls" in line and "$0.0008" in line for line in lines)
     assert "| category | name | n |" in "\n".join(printed[len(lines):])
 

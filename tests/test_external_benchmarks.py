@@ -1629,3 +1629,152 @@ def test_a_benchmark_run_skips_the_coverage_audit_unless_asked(monkeypatch):
     assert args.coverage_audit is False
     assert "coverage_audit" not in eb.run_options(args)  # a resumed run reuses its parts
     assert eb.parse_args(["--dataset", "locomo", "--coverage-audit"]).coverage_audit is True
+
+
+# --------------------------------------------------------------------------
+# the context a question is answered from is the product's (turn search included)
+
+
+from test_turn_search import _ASKED, _EXCERPT, _TALK, ScriptedJudge, WordEmbedder  # noqa: E402
+
+from memry.intelligence.context import estimate_tokens  # noqa: E402
+from memry.models import SearchResult  # noqa: E402
+
+
+class TalkLLM(LLM):
+    """Extraction keeps three facts of the talk in ``test_turn_search``. Two
+    of them name Ada. None comes from the turn with the answer. Ada's
+    description is one sentence."""
+
+    name = "talk"
+    available = True
+
+    def complete(self, system: str, user: str, *, json_schema=None) -> str:
+        if system.startswith("You are the long-term memory extraction system"):
+            def fact(content, sources, named):
+                return {"content": content, "type": "episodic", "importance": 0.6,
+                        "categories": [], "relations": [], "when": None, "sources": sources,
+                        "entities": [{"name": "Ada", "type": "person"}] if named else []}
+            return json.dumps({"facts": [
+                fact("Ada went to Tokyo in March for her sister's wedding", [1, 5], True),
+                fact("Ada saw the wedding in a small temple in Tokyo", [5], True),
+                fact("Bea is repainting her kitchen pale green", [6, 7], False)]})
+        if system == DESCRIPTION_SYSTEM:
+            return json.dumps({"description": "Ada went to Tokyo for her sister's wedding."})
+        if "decide one action" in system:
+            return json.dumps({"action": "ADD", "target": None, "content": None, "reason": "new"})
+        if system.startswith("You audit"):
+            return json.dumps({"missing": []})
+        return "{}"
+
+
+class StagedJudge(ScriptedJudge):
+    """``ScriptedJudge`` that keeps the stage each excerpt call is counted under."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.excerpt_stages: list[str | None] = []
+
+    def decide(self, state, questions):
+        first = next(iter(questions.values())).instructions
+        if first.startswith(_EXCERPT):
+            self.excerpt_stages.append(api_usage.current_stage())
+        return super().decide(state, questions)
+
+
+def _talk_run(judge: ScriptedJudge, k: int = 3):
+    """The talk as a LoCoMo conversation, saved by the runner into a store
+    with the default settings, and its question asked through the runner
+    (Mem0's answer prompt) and through ``reconstruct_context`` (MCP
+    get_memory_context) at the runner's k and token budget."""
+    turns = [xb.Turn(key=f"D1:{i + 1}", role=who, raw=text, text=f"{who}: {text}")
+             for i, (who, text) in enumerate(_TALK)]
+    session = xb.Session("session_1", xb.parse_bench_date("2 May 2026"), "2 May 2026", turns)
+    question = xb.Question("talk/q0", _ASKED, "Tokyo's Times Square", 4, "single-hop",
+                           ["D1:3"], "turn")
+    conv = xb.Conversation("talk", "conversation", [session], [question])
+    store = MemoryStore(Config(db_path=":memory:"), llm=TalkLLM(), embedder=WordEmbedder(),
+                        decider=judge)
+    chat = ScriptedChat("Tokyo's Times Square")
+    try:
+        assert store.config.retrieval.model_dump() == Config().retrieval.model_dump()
+        ingested = xb.ingest(store, conv, mode="extract", unit="session", dataset="locomo")
+        row = xb.ask(ingested, question, k=k, answer_llm=chat,
+                     answer_prompt=mem0_judge.answer_messages)
+        agent = store.reconstruct_context(_ASKED, user_id=xb.BENCH_USER, limit=k,
+                                          token_budget=xb.CONTEXT_TOKENS)
+        found = store.search(_ASKED, user_id=xb.BENCH_USER, limit=k, evidence=False)
+        evidence = store.evidence(_ASKED, found, user_id=xb.BENCH_USER)
+    finally:
+        store.close()
+    ((messages, _),) = chat.sent
+    return row, messages, agent, ingested, found, evidence
+
+
+def test_with_default_settings_the_runner_answers_from_the_products_context():
+    """A benchmark measures the product as it ships. With the default
+    settings the memory list a question is answered from is the context an
+    agent gets from get_memory_context (``reconstruct_context``) for the
+    same question at the runner's k and token budget: its lines in its
+    order without its headings (the description of Ada, the memories, their
+    evidence turns, then turn search's turns), the same memories and the
+    same turns."""
+    defaults = Config().retrieval
+    assert defaults.turn_search and defaults.question_keys and defaults.entity_questions
+    assert (defaults.turn_search_bar, defaults.turn_search_several,
+            defaults.turn_search_complete) == (0.8, 0.5, 0.7)
+    row, messages, agent, ingested, _, _ = _talk_run(ScriptedJudge(facts=0.2))
+    lines = [line[2:] for line in agent.text.splitlines() if line.startswith("- ")]
+    assert messages == mem0_judge.answer_messages(_ASKED, lines)
+    # the context has every part, turn search's turns last
+    assert lines[0] == "Ada (person): Ada went to Tokyo for her sister's wedding."
+    assert "More of what was said that matches the question" in agent.text
+    assert lines[-2] == f"2 May 2026: Ada: {_TALK[2][1]}"
+    answer = row["answers"]["3"]
+    assert answer["excerpt_turns"] == ["D1:2", "D1:3", "D1:4"]
+    assert [ingested.turn_of_episode[e] for e in agent.episode_ids] == (
+        answer["evidence"] + answer["excerpt_turns"])
+    assert answer["k"] == 3 and row["described"] == ["Ada"]
+
+
+def test_each_answer_records_what_turn_search_did():
+    """Each answer, and the row for the headline k, has turn search's
+    record: whether it ran, why, the excerpts judged and shown, the turns
+    shown and their tokens in the memory list. Its judge call is counted
+    with the search. With no trigger met, turn search does not run. The list
+    is then the memories and their turns, as before."""
+    judge = StagedJudge(facts=0.2)
+    row, messages, _, ingested, found, evidence = _talk_run(judge)
+    record = row["turn_search"]
+    assert record == row["answers"]["3"]["turn_search"]
+    assert (record["ran"], record["why"], record["best"]) == (True, ["relevance"], 0.2)
+    assert (record["excerpts"], record["turns"]) == (1, 3) and record["judged"] >= 1
+    shown = [f"2 May 2026: {who}: {text}" for who, text in _TALK[1:4]]
+    assert record["budget_tokens"] == sum(estimate_tokens(line) + 1 for line in shown)
+    listed = json.loads(messages[0]["content"].split("Memories:\n\n    ", 1)[1]
+                        .split("\n\n    Question:", 1)[0])
+    assert listed[-3:] == shown
+    with_turns = xb.count_tokens(mem0_judge.memories_json(listed))
+    if with_turns is not None:
+        assert record["tokens"] == with_turns - xb.count_tokens(
+            mem0_judge.memories_json(listed[:-3]))
+    # the runner's call, then the one of the agent's context made after it, in no stage
+    assert judge.excerpt_stages == ["search", ""]
+
+    quiet = StagedJudge(facts=0.9)
+    row, messages, _, _, found, evidence = _talk_run(quiet)
+    assert row["turn_search"] == {"ran": False, "why": [], "best": 0.9, "judged": 0,
+                                  "excerpts": 0, "turns": 0, "tokens": 0, "budget_tokens": 0}
+    assert quiet.excerpt_calls() == [] and row["answers"]["3"]["excerpt_turns"] == []
+    described = [line for line in json.loads(messages[0]["content"].split(
+        "Memories:\n\n    ", 1)[1].split("\n\n    Question:", 1)[0]) if "(person)" in line]
+    assert messages == mem0_judge.answer_messages(_ASKED, described + memory_lines(
+        [r.memory for r in found], evidence))
+
+
+def test_a_context_at_k_holds_every_set_member_as_a_search_of_limit_k_does():
+    results = [SearchResult(memory=Memory(content=f"m{i}"), score=1.0,
+                            signals={"member": 1.0} if i < 4 else {}) for i in range(8)]
+    assert [r.memory.content for r in xb.at_k(results, 2)] == ["m0", "m1", "m2", "m3"]
+    assert [r.memory.content for r in xb.at_k(results, 6)] == [f"m{i}" for i in range(6)]
+    assert len(xb.at_k(results[4:], 2)) == 2

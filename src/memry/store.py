@@ -48,6 +48,7 @@ from .intelligence.context import (
     estimate_tokens,
     fitting,
     memory_line,
+    packed,
     said_at,
     turn_line,
 )
@@ -636,6 +637,11 @@ class FilteredSearch:
     results: list[SearchResult]
     filters: Filters
     nearest: list[tuple[Memory, int, str]] = field(default_factory=list)
+    #: Turn search's turns for a search without filters (``search_filtered``
+    #: with ``excerpts``), in the order said, and its note
+    #: (``MemoryStore.turn_search``).
+    excerpts: list[EvidenceTurn] = field(default_factory=list)
+    turn_search: dict[str, Any] = field(default_factory=dict)
 
     @property
     def note(self) -> str:
@@ -649,6 +655,28 @@ class FilteredSearch:
                 parts.append("The memories nearest that time are listed as nearest, "
                              "with how many days before or after it; none is inside it.")
         return " ".join(parts)
+
+
+@dataclass
+class AgentContext:
+    """An agent's context for a question (``MemoryStore.context_from``):
+    what it shows, part by part, as ``build_context`` packs it, and the text
+    an agent reads (``context``, what ``reconstruct_context`` returns)."""
+
+    #: The entities the question names, with their descriptions, shown first.
+    entities: list[Entity]
+    #: The memories shown, best first.
+    results: list[SearchResult]
+    #: The source turns shown as the memories' evidence, in the order said.
+    evidence: list[EvidenceTurn]
+    #: Turn search's turns, in the order said.
+    excerpts: list[EvidenceTurn]
+    #: Turn search's note (``MemoryStore.turn_search``): "why" (its
+    #: triggers, none when it was not due), "due" and "best" always;
+    #: "candidates", "excerpts" (each judged) and "chosen" when the turns
+    #: were searched.
+    turn_search: dict[str, Any]
+    context: ContextResult
 
 
 @dataclass(frozen=True)
@@ -3693,7 +3721,9 @@ class MemoryStore:
         ``context.description_budget``). The memories that fit take the budget
         but a share for their evidence (``retrieval.evidence_tokens``, at most
         half of what is left), and their source turns that best match the
-        query fill that share (``evidence``).
+        query fill that share (``evidence``). When turn search is due, its
+        turns take a share of their own (``_context``). The steps after the
+        search are ``context_from``'s, which the benchmark runner calls.
 
         With ``filters`` only memories they admit are shown, so no entity
         description (written from all of an entity's memories) is: the
@@ -3720,35 +3750,98 @@ class MemoryStore:
                 query, user_id=user_id, agent_id=agent_id, run_id=run_id, limit=limit,
                 evidence=False,
             )
-        entities = [] if header else self.described_entities(
-            query, user_id=user_id, agent_id=agent_id, run_id=run_id,
-            token_budget=description_budget(token_budget),
-        )
+        return self._context(query, results, user_id=user_id, agent_id=agent_id,
+                             run_id=run_id, token_budget=token_budget, header=header,
+                             period=period).context
+
+    def context_from(
+        self,
+        query: str,
+        results: list[SearchResult],
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        token_budget: int = CONTEXT_TOKENS,
+        entities: list[Entity] | None = None,
+        evidence_tokens: int | None = None,
+    ) -> AgentContext:
+        """The context ``reconstruct_context`` gives an agent for ``query``
+        without filters, from the results of a search already made
+        (``search`` with ``evidence=False``, best first), in its parts. The
+        benchmark runner reads each question's context here, from the one
+        search it makes of the question. ``entities`` are the described
+        entities shown first, when the caller has them
+        (``described_entities`` within ``description_budget(token_budget)``;
+        [] shows none). ``evidence_tokens`` is the evidence's budget in place
+        of ``retrieval.evidence_tokens``."""
+        return self._context(query, results, user_id=user_id, agent_id=agent_id,
+                             run_id=run_id, token_budget=token_budget, entities=entities,
+                             evidence_tokens=evidence_tokens)
+
+    def _context(
+        self,
+        query: str,
+        results: list[SearchResult],
+        *,
+        user_id: str | None,
+        agent_id: str | None,
+        run_id: str | None,
+        token_budget: int,
+        entities: list[Entity] | None = None,
+        evidence_tokens: int | None = None,
+        header: str = "",
+        period: Any = None,
+    ) -> AgentContext:
+        """``reconstruct_context`` after its search. The descriptions come
+        first, or the filters' ``header`` in their place. The memories that
+        fit take what is left but a share for their evidence (at most half)
+        and, when turn search is due (``turn_search_reasons``), a share for
+        its excerpts (at most a quarter). Their source turns that best match
+        the query fill the first share (``evidence``), turn search's turns
+        the second (``turn_search``). With filters no turns are searched:
+        the turns would not be held to the filters."""
+        cfg = self.config.retrieval
+        if header:
+            entities = []
+        elif entities is None:
+            entities = self.described_entities(
+                query, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                token_budget=description_budget(token_budget))
         entity_text = header or entities_text(entities)
         entity_memory_ids = [memory.id for entity in entities
                              for memory in self.backend.entity_memories(entity.id, limit=20)]
         remaining = max(0, token_budget - estimate_tokens(entity_text))
-        share = min(max(self.config.retrieval.evidence_tokens, 0), remaining // 2)
+        budget = cfg.evidence_tokens if evidence_tokens is None else evidence_tokens
+        share = min(max(budget, 0), remaining // 2)
         # turn search, when due, takes its share before the memories are packed
-        quoted = (min(max(self.config.retrieval.turn_search_tokens, 0), remaining // 4)
-                  if not header and self.turn_search_due(results) else 0)
-        shown = fitting(results, remaining - share - quoted, self._asked_bounds(period))
+        note: dict[str, Any] = {"best": judged_best(results),
+                                "why": [] if header else self.turn_search_reasons(results)}
+        note["due"] = bool(note["why"])
+        quoted = min(max(cfg.turn_search_tokens, 0), remaining // 4) if note["due"] else 0
+        asked = self._asked_bounds(period)
+        shown = fitting(results, remaining - share - quoted, asked)
         turns = self.evidence(query, shown, user_id=user_id, agent_id=agent_id,
                               run_id=run_id, token_budget=share)
         excerpts = self.turn_search(query, shown, user_id=user_id, agent_id=agent_id,
-                                    run_id=run_id, shown=turns,
-                                    token_budget=quoted) if quoted else []
+                                    run_id=run_id, shown=turns, token_budget=quoted,
+                                    note=note) if quoted else []
         memory_context = build_context(shown, token_budget=remaining, evidence=turns,
-                                       excerpts=excerpts, asked=self._asked_bounds(period))
+                                       excerpts=excerpts, asked=asked)
+        shown, turns, excerpts = packed(shown, token_budget=remaining, evidence=turns,
+                                        excerpts=excerpts, asked=asked)
         parts = [part for part in (entity_text, memory_context.text) if part]
         combined = "\n\n".join(parts)
         memory_ids = list(dict.fromkeys([*entity_memory_ids, *memory_context.memory_ids]))
-        return ContextResult(
-            text=combined,
-            memory_ids=memory_ids,
-            token_estimate=estimate_tokens(combined) if combined else 0,
-            episode_ids=memory_context.episode_ids,
-        )
+        return AgentContext(
+            entities=list(entities), results=shown, evidence=turns, excerpts=excerpts,
+            turn_search=note,
+            context=ContextResult(
+                text=combined,
+                memory_ids=memory_ids,
+                token_estimate=estimate_tokens(combined) if combined else 0,
+                episode_ids=memory_context.episode_ids,
+            ))
 
     @staticmethod
     def _asked_bounds(period: Any) -> tuple[date | None, date | None] | None:
@@ -3927,14 +4020,21 @@ class MemoryStore:
         self, query: str, filters: Filters, *, user_id: str | None = None,
         agent_id: str | None = None, run_id: str | None = None, limit: int = 10,
         include_invalid: bool = False, owner_prefix: str | None = None,
-        evidence: bool = True, legacy: dict[str, Any] | None = None,
+        evidence: bool = True, excerpts: bool = False,
+        legacy: dict[str, Any] | None = None,
     ) -> FilteredSearch:
         """``search`` with ``filters``, as the tools and endpoints answer it
         (``FilteredSearch``): the results, the notes of the filters, and for
         a time asked about that matched nothing, the nearest dated memories
         (``nearest_dated``). An empty query browses what the filters admit.
         ``legacy`` are ``search``'s own filter arguments (``categories``,
-        ``entity_id``, ``since``, ...), checked by the caller."""
+        ``entity_id``, ``since``, ...), checked by the caller.
+
+        With ``excerpts`` and ``evidence``, a search without filters also
+        gets turn search's turns when it is due (``turn_search``, within
+        ``retrieval.turn_search_tokens``), as ``reconstruct_context`` shows
+        them; a turn already shown as evidence is not repeated. With filters
+        no turns are searched, as for a context with filters."""
         filters = self.resolve_filters(filters, user_id=user_id, agent_id=agent_id,
                                        owner_prefix=owner_prefix)
         results = self.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id,
@@ -3942,7 +4042,12 @@ class MemoryStore:
                               filters=filters, evidence=evidence, **(legacy or {}))
         nearest = (self.nearest_dated(filters, user_id=user_id, agent_id=agent_id)
                    if not results and filters.period is not None else [])
-        return FilteredSearch(results=results, filters=filters, nearest=nearest)
+        found = FilteredSearch(results=results, filters=filters, nearest=nearest)
+        if excerpts and evidence and not filters.active and not any((legacy or {}).values()):
+            found.excerpts = self.turn_search(
+                query, results, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                shown=[turn for r in results for turn in r.evidence], note=found.turn_search)
+        return found
 
     def get(self, memory_id: str, *, owner_prefix: str | None = None) -> Memory | None:
         memory = self.backend.get_memory(memory_id)

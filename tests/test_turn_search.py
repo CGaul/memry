@@ -567,3 +567,56 @@ def test_with_turn_search_off_the_triggers_change_nothing():
     assert all("complete" not in k for k in keys)
     assert not note["due"] and note["why"] == []
     assert context == unset[5] and "More of what was said" not in context
+
+
+# -- both read paths an agent calls carry turn search's turns --
+
+
+def test_search_memories_carries_the_turns_get_memory_context_shows():
+    """MCP search_memories returns turn search's turns, as get_memory_context
+    does. They are "excerpts" on the first row, written as the evidence is
+    (said, speaker, text), in the order said. None of them repeats a turn of
+    the evidence. No row has "excerpts", and no excerpt is judged, in each
+    of these cases:
+
+    - a filter;
+    - a fact judged at the bar;
+    - turn search off."""
+    from test_servers import call_tool
+
+    from memry.mcp_server import create_server
+
+    judge = ScriptedJudge(facts=0.2)
+    store = _store(judge)
+    store.config.retrieval.relational_relevance = Config().retrieval.relational_relevance
+    try:
+        _save(store)
+        server = create_server(store, manage_enrichment_worker=False)
+        asked = {"query": _ASKED, "user_id": "ada"}
+        first, *rest = call_tool(server, "search_memories", asked)
+        assert len(judge.excerpt_calls()) == 1
+        said = [text for _, text in _TALK]
+        assert [turn["text"] for turn in first["excerpts"]] == said[1:4]
+        assert first["excerpts"][1] == {"said": "2026-05-02", "speaker": "Ada", "text": said[2]}
+        assert all("excerpts" not in row for row in rest)
+        evidence = {turn["text"] for row in [first, *rest] for turn in row.get("evidence", [])}
+        assert evidence and not evidence & set(said[1:4])
+        context = call_tool(server, "get_memory_context", asked)
+        assert "More of what was said that matches the question" in context
+        assert f"- 2 May 2026: Ada: {said[2]}" in context
+        calls = len(judge.excerpt_calls())
+
+        def quiet(**more) -> None:
+            found = call_tool(server, "search_memories", {**asked, **more})
+            rows = found["memories"] if isinstance(found, dict) else found
+            assert rows and all("excerpts" not in row for row in rows)
+            assert len(judge.excerpt_calls()) == calls
+
+        quiet(when="2026-05")  # a filter: no turns searched, as a context with filters
+        judge.facts = 0.9
+        quiet()
+        judge.facts = 0.2
+        store.config.retrieval.turn_search = False
+        quiet()
+    finally:
+        store.close()

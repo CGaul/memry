@@ -810,7 +810,9 @@ within `retrieval.turn_search_tokens` (400). Without a decision provider nothing
 and Memry runs no turn search. A turn of a deleted or forgotten memory never comes back.
 Neither does a turn of a save of which extraction kept nothing, nor a loose turn of a save
 a delete touched, nor a loose turn that looks like a password or a key. A loose turn is
-one no memory rests on. Only `get_memory_context` shows the excerpts. `MEMRY_TURN_SEARCH=0`
+one no memory rests on. `get_memory_context` shows the excerpts after the memories, and
+`search_memories` returns them as "excerpts" on its first row. Memry runs no turn search
+for a call with filters. `MEMRY_TURN_SEARCH=0`
 (or `retrieval.turn_search` set to false in `~/.memry/config.json`) turns it off.
 Memry also runs turn search in two more cases, each with its own setting:
 

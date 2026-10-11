@@ -39,22 +39,32 @@ Every question is asked through ``MemoryStore.search`` (user "bench", the top
             0 when none of the top 20 does
   search ms median time of one search
 
-With --answer the configured LLM answers each question from the top --k
-memories (--context: from ``MemoryStore.reconstruct_context``) and the
-answer is scored against the gold one. The model is shown what Memry's
-context builder gives an agent for the question (``intelligence.context.
-context_lines``): the descriptions of the entities the question names
-(``MemoryStore.described_entities``, built by the store's text model where
-stale and counted under the stage "describe"; --no-descriptions leaves them
-out), then the memories, each with the date its event happened, where known,
-and the date it was said, then their source turns that best match the
-question (``MemoryStore.evidence``, within the store's
-``retrieval.evidence_tokens``; --evidence-tokens sets it, 0 shows none).
+With --answer the configured LLM answers each question at --k and the
+answer is scored against the gold one. The model is shown the context the
+product gives an agent for the question (``MemoryStore.context_from``, the
+code of ``reconstruct_context`` and MCP get_memory_context after their
+search), built from the one search's results that a search of limit k
+returns (``at_k``: the first k, or every member of a set found), within
+``CONTEXT_TOKENS``, and written as the lines of that context without its
+headings (``context_list``; --context: the context's text as an agent
+reads it, with the harness's own prompt). The lines are the descriptions of
+the entities the question names (``MemoryStore.described_entities``, built
+by the store's text model where stale and counted under the stage
+"describe"; --no-descriptions leaves them out), then the memories that fit,
+each with the date its event happened, where known, and the date it was
+said, then their source turns that best match the question
+(``MemoryStore.evidence``, within the store's ``retrieval.evidence_tokens``;
+--evidence-tokens sets it, 0 shows none), then turn search's turns when it
+is due (``MemoryStore.turn_search``, on by default; its judge calls are
+counted with the search). Each answer has turn search's record
+(``turn_search_record``: whether it ran, its triggers, its excerpts and
+their tokens) and its turns ("excerpt_turns").
 --compare-evidence-tokens N answers
-each question a second time from the same search, its turns chosen within N
-tokens (0: the memories alone), with no further search: those answers are
-scored and judged as the others, kept under the row's "answers_compared" and
-counted under the stages "answer:compared" and "judge:compared".
+each question a second time from the same search, its context's evidence
+within N tokens (0: the memories alone), with no further search: those
+answers are scored and judged as the others, kept under the row's
+"answers_compared" and counted under the stages "answer:compared" and
+"judge:compared".
 --compare-answer-model MODEL has MODEL write that second answer, from the
 same memory list (the turns within N tokens where both are given), the way
 published LoCoMo rows compare answer models over one memory:
@@ -221,9 +231,17 @@ sys.path.insert(0, str(HERE.parent))
 
 from evals import api_usage  # noqa: E402
 from memry.config import Config, DecisionConfig, EmbeddingConfig  # noqa: E402
-from memry.intelligence.context import context_lines  # noqa: E402
+from memry.intelligence.context import (  # noqa: E402
+    context_lines,
+    description_budget,
+    estimate_tokens,
+    turn_line,
+)
 from memry.intelligence.entities import DESCRIPTION_MIN_MEMORIES  # noqa: E402
-from memry.intelligence.graph_retrieval import detect_query_entities  # noqa: E402
+from memry.intelligence.graph_retrieval import (  # noqa: E402
+    SET_RESULT_CAP,
+    detect_query_entities,
+)
 from memry.models import Memory, Scope  # noqa: E402
 from memry.providers.decisions import (  # noqa: E402
     Decider,
@@ -233,14 +251,18 @@ from memry.providers.decisions import (  # noqa: E402
 )
 from memry.providers.embeddings import Embedder, HashEmbedder, OpenAIEmbedder  # noqa: E402
 from memry.providers.llm import LLM, NoneLLM, build_llm  # noqa: E402
-from memry.store import MemoryStore  # noqa: E402
+from memry.store import AgentContext, MemoryStore  # noqa: E402
 
 DATA_ENV = "MEMRY_BENCH_DATA"
 DATASETS = ("locomo", "longmemeval")
 BENCH_USER = "bench"
 KS = (5, 10, 20)
 DEPTH = max(KS)
-#: Token budget of the context block with --context.
+#: The token budget of the context each question is answered from
+#: (``MemoryStore.context_from``), the memory list and --context alike. At
+#: it the descriptions (300) and the evidence (``retrieval.evidence_tokens``,
+#: 600) have the budgets the runner gave them before the context was the
+#: product's, and 20 memories fit beside them and turn search's 400.
 CONTEXT_TOKENS = 4000
 
 #: LoCoMo's "category" number -> name. The paper names five kinds of question
@@ -1214,17 +1236,60 @@ def memory_record(result: Any, ingested: Ingested) -> dict[str, Any]:
             "turns": sorted(ingested.turns_of(memory))}
 
 
-def answer_with(answer_llm: LLM, question: Question, memories: list[Memory],
-                answer_prompt: AnswerPrompt | None, evidence: list[Any] = (),
-                entities: list[Any] = ()) -> dict[str, Any]:
-    """One answering call from what Memry gives a model for the question:
-    the descriptions of the ``entities`` it names, then ``memories`` and
-    their ``evidence`` turns, as its context builder renders them
-    (``context_lines``). That list is the memory list of the answer prompt
-    (``answer_from``); ``k`` counts the memories."""
-    record = answer_from(answer_llm, question, context_lines(entities, memories, evidence),
-                         answer_prompt)
-    record["k"] = len(memories)
+def context_list(context: AgentContext, *, excerpts: bool = True) -> list[str]:
+    """An agent's context as the answer prompt's memory list: the lines of
+    the text an agent reads (``context.context.text``), in its order,
+    without its headings (``context_lines``): the descriptions, the
+    memories, their evidence turns, then turn search's turns (none with
+    ``excerpts`` false)."""
+    return context_lines(context.entities, [r.memory for r in context.results],
+                         context.evidence, excerpts=context.excerpts if excerpts else ())
+
+
+def at_k(results: list[Any], k: int) -> list[Any]:
+    """The results a search of limit ``k`` returns of these (a search's,
+    best first): the first ``k``, or every member of a set found when there
+    are more, up to ``SET_RESULT_CAP`` (``MemoryStore.search``)."""
+    members = sum(1 for r in results if (r.signals or {}).get("member"))
+    return results[:max(k, min(members, SET_RESULT_CAP))]
+
+
+def turn_search_record(context: AgentContext,
+                       answer_prompt: AnswerPrompt | None = None) -> dict[str, Any]:
+    """Turn search's record for one context: whether it ran (``ran``: the
+    turns were searched), its triggers (``why``: "relevance", "several",
+    "incomplete"; none when it was not due), the judge's best relevance
+    over the memories (``best``; None for a search not judged), how many
+    excerpts were judged (``judged``) and shown (``excerpts``), how many
+    turns were shown (``turns``), and their tokens: those they add to the
+    memory list as ``answer_prompt`` writes it (``tokens``, cl100k_base;
+    None without tiktoken; the harness's own list for None) and those the
+    store's budget counts (``budget_tokens``)."""
+    note = context.turn_search
+    tokens: int | None = 0
+    if context.excerpts:
+        full = count_tokens(context_text(answer_prompt, context_list(context)))
+        bare = count_tokens(context_text(answer_prompt, context_list(context, excerpts=False)))
+        tokens = full - bare if full is not None and bare is not None else None
+    best = note.get("best")
+    return {"ran": "candidates" in note, "why": list(note.get("why") or []),
+            "best": round(best, 4) if best is not None else None,
+            "judged": len(note.get("excerpts") or []),
+            "excerpts": len(note.get("chosen") or []) if context.excerpts else 0,
+            "turns": len(context.excerpts), "tokens": tokens,
+            "budget_tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in context.excerpts)}
+
+
+def answer_with(answer_llm: LLM, question: Question, context: AgentContext,
+                answer_prompt: AnswerPrompt | None) -> dict[str, Any]:
+    """One answering call from what Memry gives an agent for the question
+    (``MemoryStore.context_from``): the descriptions of the entities it
+    names, the memories, their evidence turns and turn search's turns, as
+    its context builder renders them (``context_list``). That
+    list is the memory list of the answer prompt (``answer_from``); ``k``
+    counts the memories."""
+    record = answer_from(answer_llm, question, context_list(context), answer_prompt)
+    record["k"] = len(context.results)
     return record
 
 
@@ -1259,7 +1324,8 @@ def answer_from(answer_llm: LLM, question: Question, items: list[Any],
 #: The fields of the headline answer a row carries at its top level.
 ANSWER_FIELDS = ("prediction", "answer_error", "answer_seconds", "context_tokens",
                  "input_tokens", "f1", "em", "contains", "f1_mem0", "bleu1", "judge", "judges",
-                 "judge_error", "judge_corrected", "judges_corrected", "judge_clean")
+                 "judge_error", "judge_corrected", "judges_corrected", "judge_clean",
+                 "turn_search")
 
 
 def judge_answers(answers: dict[Any, dict[str, Any]], question: Question, judge: Judge,
@@ -1320,30 +1386,37 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         compare_answer_llm: LLM | None = None,
         descriptions: bool = True) -> dict[str, Any]:
     """Search for one question once, score what came back, and answer when
-    asked: from the top k of that search for each k of ``ks`` (default
-    ``[k]``), after the descriptions of the entities the question names
+    asked: for each k of ``ks`` (default ``[k]``), from the context the
+    product gives an agent (``MemoryStore.context_from``, the steps of
+    ``reconstruct_context`` after its search) from the results a search of
+    limit k returns of that one search (``at_k``), within ``CONTEXT_TOKENS``:
+    the descriptions of the entities the question names
     (``MemoryStore.described_entities``, built where stale under the stage
-    "describe"; none with ``descriptions`` false), each answer judged
-    ``judge_runs`` times (``judge_answers``).
+    "describe"; none with ``descriptions`` false), the memories that fit,
+    their evidence turns and turn search's turns when it is due. Each
+    answer is judged ``judge_runs`` times (``judge_answers``) and has turn
+    search's record (``turn_search_record``).
     The row carries the answer at ``k`` at its top level and every answer
-    under "answers". The model calls are counted under ``search_stage``,
-    "answer" and "judge"; with ``pool`` (a thread pool) a question's answer
-    calls, and then its judge calls, run at once. With
-    ``compare_evidence_tokens`` each k is answered a second time from the
-    same memories, their turns chosen within that many tokens (0: none),
-    kept under "answers_compared" and counted under "answer:compared" and
-    "judge:compared"; ``compare_answer_llm`` writes that second answer (the
-    turns within the store's own budget unless ``compare_evidence_tokens``
-    is given too)."""
+    under "answers". The model calls are counted under ``search_stage``
+    (turn search's judge calls too), "answer" and "judge"; with ``pool`` (a
+    thread pool) a question's answer calls, and then its judge calls, run
+    at once. With ``compare_evidence_tokens`` each k is answered a second
+    time from the same search, its context's evidence within that many
+    tokens (0: none), kept under "answers_compared" and counted under
+    "answer:compared" and "judge:compared"; ``compare_answer_llm`` writes
+    that second answer (the store's own evidence budget unless
+    ``compare_evidence_tokens`` is given too). ``use_context`` answers at
+    ``k`` only, from the context's text as an agent reads it, with the
+    harness's own prompt."""
     ks = sorted(set(ks or [k]) | {k})
     depth = max(DEPTH, *ks)
     store = ingested.store
     started = time.perf_counter()
     with api_usage.stage(search_stage):
-        results = store.search(question.question, user_id=BENCH_USER, limit=depth,
-                               evidence=False)
+        found = store.search(question.question, user_id=BENCH_USER, limit=depth,
+                             evidence=False)
     ms = (time.perf_counter() - started) * 1000
-    results = results[:depth]
+    results = found[:depth]
     units = [ingested.units_of(r.memory, question.level) for r in results]
     row: dict[str, Any] = {
         "conversation": ingested.conversation.conv_id, "qid": question.qid,
@@ -1366,13 +1439,34 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         return row
     if correction is not None:
         row["audit"] = {key: correction.get(key) for key in ("error_type", "correct_answer")}
-    answers: dict[int, dict[str, Any]] = {}
-    compared: dict[int, dict[str, Any]] = {}
+    # the entities the question names, described as an agent's context describes them
+    described: list[Any] = []
+    if descriptions:
+        with api_usage.stage("describe"):
+            described = store.described_entities(
+                question.question, user_id=BENCH_USER,
+                token_budget=description_budget(CONTEXT_TOKENS))
+    row["described"] = [entity.name for entity in described]
+    # each variant's evidence budget (None: the store's own), as its answer stage names it
+    budgets = {"answer": None}
+    if not use_context and (compare_evidence_tokens is not None
+                            or compare_answer_llm is not None):
+        budgets["answer:compared"] = compare_evidence_tokens
+    # each variant's model: the compared answer's own where one is given
+    writers = {"answer": answer_llm, "answer:compared": compare_answer_llm or answer_llm}
+    # an agent's context at each k, as the product builds it from a search of that
+    # limit, once for each budget; turn search's judge calls count with the search
+    wanted = [k] if use_context else ks
+    with api_usage.stage(search_stage):
+        built = {(budget, at): store.context_from(
+                     question.question, at_k(found, at), user_id=BENCH_USER,
+                     token_budget=CONTEXT_TOKENS, entities=described, evidence_tokens=budget)
+                 for budget in dict.fromkeys(budgets.values()) for at in wanted}
+    contexts = {(name, at): built[(budget, at)] for name, budget in budgets.items()
+                for at in wanted}
     if use_context:
-        with api_usage.stage(search_stage):
-            context = store.reconstruct_context(question.question, user_id=BENCH_USER, limit=k,
-                                                token_budget=CONTEXT_TOKENS)
-        in_context = [store.get(mid) for mid in context.memory_ids]
+        context = contexts[("answer", k)]
+        in_context = [store.get(mid) for mid in context.context.memory_ids]
         row["context_recall"] = evidence_recall(
             [ingested.units_of(m, question.level) for m in in_context if m],
             question.evidence, len(in_context))
@@ -1381,49 +1475,32 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
             record: dict[str, Any] = {"k": k}
             try:
                 record["prediction"] = answer_question(
-                    answer_llm, question, context.text or "Memories: (none found)")
+                    answer_llm, question, context.context.text or "Memories: (none found)")
             except Exception as exc:  # one failed call must not end a long run
                 record["prediction"], record["answer_error"] = "", str(exc)[:300]
             record["answer_seconds"] = round(time.perf_counter() - started, 3)
-            answers[k] = record
+            done = {("answer", k): record}
+    elif pool is not None and len(contexts) > 1:
+        futures = {key: pool.submit(contextvars.copy_context().run, staged, key[0],
+                                    answer_with, writers[key[0]], question, context,
+                                    answer_prompt)
+                   for key, context in contexts.items()}
+        done = {key: future.result() for key, future in futures.items()}
     else:
-        top = [r.memory for r in results]
-        # the entities the question names, described as an agent's context describes them
-        described: list[Any] = []
-        if descriptions:
-            with api_usage.stage("describe"):
-                described = store.described_entities(question.question, user_id=BENCH_USER)
-        row["described"] = [entity.name for entity in described]
-        # each variant's evidence budget (None: the store's own), as its answer stage names it
-        budgets = {"answer": None}
-        if compare_evidence_tokens is not None or compare_answer_llm is not None:
-            budgets["answer:compared"] = compare_evidence_tokens
-        # each variant's model: the compared answer's own where one is given
-        writers = {"answer": answer_llm, "answer:compared": compare_answer_llm or answer_llm}
-        # the source turns of each k's memories, as a search of that depth chooses them,
-        # chosen once for each budget
-        with api_usage.stage(search_stage):
-            chosen = {(budget, at): store.evidence(question.question, results[:at],
-                                                   user_id=BENCH_USER, token_budget=budget)
-                      for budget in dict.fromkeys(budgets.values()) for at in ks}
-        turns = {(name, at): chosen[(budget, at)] for name, budget in budgets.items()
-                 for at in ks}
-        if pool is not None and len(turns) > 1:
-            futures = {key: pool.submit(contextvars.copy_context().run, staged, key[0],
-                                        answer_with, writers[key[0]], question, top[:key[1]],
-                                        answer_prompt, shown, described)
-                       for key, shown in turns.items()}
-            done = {key: future.result() for key, future in futures.items()}
-        else:
-            done = {key: staged(key[0], answer_with, writers[key[0]], question, top[:key[1]],
-                                answer_prompt, shown, described)
-                    for key, shown in turns.items()}
-        for key, record in done.items():
-            record["evidence"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
-                                  for t in turns[key]]
-        answers = {at: done[("answer", at)] for at in ks}
-        compared = {at: done[("answer:compared", at)] for at in ks
-                    if ("answer:compared", at) in done}
+        done = {key: staged(key[0], answer_with, writers[key[0]], question, context,
+                            answer_prompt)
+                for key, context in contexts.items()}
+    for key, record in done.items():
+        context = contexts[key]
+        record["evidence"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
+                              for t in context.evidence]
+        record["excerpt_turns"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
+                                   for t in context.excerpts]
+        record["turn_search"] = turn_search_record(
+            context, None if use_context else answer_prompt)
+    answers: dict[int, dict[str, Any]] = {at: done[("answer", at)] for at in wanted}
+    compared: dict[int, dict[str, Any]] = {at: done[("answer:compared", at)] for at in wanted
+                                           if ("answer:compared", at) in done}
     everything: dict[Any, dict[str, Any]] = {**answers}
     everything.update({("compared", at): record for at, record in compared.items()})
     with api_usage.stage("judge"):
@@ -1946,6 +2023,7 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
         entry["text_model"] = getattr(store.llm, "model", None) if store.llm.available else None
         entry["text_effort"] = getattr(store.llm, "effort", None) if store.llm.available else None
         entry["evidence_tokens"] = store.config.retrieval.evidence_tokens
+        entry["turn_search"] = turn_search_settings(store)
         try:
             with api_usage.labelled(conv.conv_id):
                 if mode == "extract" and not store.llm.available:
@@ -2026,7 +2104,8 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
                    "judge": getattr(judge, "__qualname__", repr(judge)),
                    "judge_function": _qualname(judge),
                    "search_deciders": names,
-                   "context": use_context, "when": when, "evidence_tokens": evidence_tokens,
+                   "context": use_context, "context_tokens": CONTEXT_TOKENS,
+                   "when": when, "evidence_tokens": evidence_tokens,
                    "compare_evidence_tokens": compare_evidence_tokens,
                    "compare_answer_model": (getattr(compare_answer_llm, "model", None)
                                             if compare_answer_llm else None),
@@ -2042,6 +2121,29 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
         "complete": stopped is None,
         "stopped": stopped,
     }
+
+
+def turn_search_settings(store: MemoryStore) -> dict[str, Any]:
+    """The store's turn search settings, as a results file keeps them: on
+    or off, its three triggers' bars, the keep bar and its tokens."""
+    cfg = store.config.retrieval
+    return {"on": cfg.turn_search, "bar": cfg.turn_search_bar,
+            "several": cfg.turn_search_several, "complete": cfg.turn_search_complete,
+            "keep": cfg.turn_search_keep, "tokens": cfg.turn_search_tokens}
+
+
+def turn_search_text(settings: Any) -> str:
+    """Turn search settings as a line of the printed metadata reads them:
+    "on (bar 0.8, several 0.5, complete 0.7)", "off", or each store's when
+    they differ."""
+    if isinstance(settings, list):
+        return "; ".join(turn_search_text(each) for each in settings)
+    if not isinstance(settings, dict):
+        return str(settings)
+    if not settings.get("on"):
+        return "off"
+    return (f"on (bar {settings.get('bar')}, several {settings.get('several')}, "
+            f"complete {settings.get('complete')})")
 
 
 def merge_results(parts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2361,10 +2463,12 @@ def run_meta(result: dict[str, Any], args: argparse.Namespace, *, argv: list[str
             "audit": ({"file": args.audit, "sha256": file_sha256(args.audit),
                        "questions": config.get("audited_questions")} if args.audit else None),
             "full_context": config.get("full_context"), "context": config.get("context"),
+            "context_tokens": config.get("context_tokens"),
             "when": config.get("when"), "descriptions": config.get("descriptions"),
             "question_keys": args.question_keys,
             "question_keys_in_stores": _seen(stores, "question_keys"),
             "entity_questions_in_stores": _seen(stores, "entity_questions"),
+            "turn_search_in_stores": _seen(stores, "turn_search"),
             "workers": args.workers, "jobs": args.jobs, "max_calls": args.caps or None,
             "max_usd": args.max_usd,
             "coverage_audit": args.coverage_audit,
@@ -2416,7 +2520,9 @@ def meta_lines(meta: dict[str, Any]) -> list[str]:
         + f", k {config['k']} (ks {_listed(config['ks'])}), evidence tokens "
         f"{_listed(config['evidence_tokens_in_stores'])}, question keys "
         f"{config['question_keys_in_stores']}, entity questions "
-        f"{config['entity_questions_in_stores']}, descriptions {config['descriptions']}",
+        f"{config['entity_questions_in_stores']}, descriptions {config['descriptions']}, "
+        f"turn search {turn_search_text(config.get('turn_search_in_stores'))}, context tokens "
+        f"{config.get('context_tokens')}",
         f"answers: {', '.join(config['answer_models']) or 'none'}, prompt "
         f"{config['answer_prompt']}; judge {config['judge']} x{config['judge_runs']}",
     ]

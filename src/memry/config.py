@@ -64,6 +64,12 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
     max_tokens: int = 2000
     effort: str = "low"  # Anthropic effort level for extraction calls
+    #: The second pass after a save (``MemoryStore._coverage_gaps``): one text-model
+    #: call that compares what was said with the facts written and returns the
+    #: details no fact contains, as a warning for the saving agent. It writes
+    #: nothing into the store. ``MEMRY_COVERAGE_AUDIT=0`` turns it off; the
+    #: benchmark runner turns it off, since no agent reads the warning there.
+    coverage_audit: bool = True
     timeout: float = 120.0
 
     def resolved_model(self) -> str:
@@ -555,6 +561,7 @@ def _from_env() -> dict[str, Any]:
     put("llm", "api_key", e("MEMRY_LLM_API_KEY"))
     put("llm", "base_url", e("MEMRY_LLM_BASE_URL"))
     put("llm", "effort", e("MEMRY_LLM_EFFORT"))
+    put("llm", "coverage_audit", _bool(e("MEMRY_COVERAGE_AUDIT")))
 
     put("decision", "provider", e("MEMRY_DECISION_PROVIDER"))
     put("decision", "model", e("MEMRY_DECISION_MODEL"))

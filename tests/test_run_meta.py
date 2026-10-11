@@ -137,7 +137,8 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
         "evidence_tokens", "evidence_tokens_in_stores", "compare_evidence_tokens",
         "answer_models", "answer_prompt", "judge", "judge_runs", "audit", "full_context",
         "context", "when", "descriptions", "question_keys", "question_keys_in_stores",
-        "entity_questions_in_stores", "workers", "jobs", "max_calls", "max_usd"}
+        "entity_questions_in_stores", "workers", "jobs", "max_calls", "max_usd",
+        "coverage_audit"}
     assert (config["ingest"], config["embedder"], config["text_model"]) == (
         "verbatim", "hash:v1-256", None)
     assert (config["decider"], config["k"], config["ks"], config["judge_runs"]) == (

@@ -964,8 +964,9 @@ class MemoryStore:
         dropped constraint is invisible in a "success" response. One cheap LLM
         pass compares the input against what landed and names the gap. Run
         after a direct save and after distillation (the deferred save), with a
-        text model and something written; best-effort, it never fails a save."""
-        if not (self.llm.available and actions):
+        text model and something written; best-effort, it never fails a save.
+        ``llm.coverage_audit`` off skips it."""
+        if not (self.config.llm.coverage_audit and self.llm.available and actions):
             return []
         stored = [a.content for a in actions if a.content]
         try:

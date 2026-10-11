@@ -1940,6 +1940,7 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
         if question_keys in ("on", "both"):
             store.config.retrieval.question_keys = True
         entry["question_keys"] = store.config.retrieval.question_keys
+        entry["coverage_audit"] = store.config.llm.coverage_audit
         entry["decider"] = store.decider.name
         entry["decider_model"] = getattr(store.decider, "model", None)
         entry["text_model"] = getattr(store.llm, "model", None) if store.llm.available else None
@@ -2366,6 +2367,7 @@ def run_meta(result: dict[str, Any], args: argparse.Namespace, *, argv: list[str
             "entity_questions_in_stores": _seen(stores, "entity_questions"),
             "workers": args.workers, "jobs": args.jobs, "max_calls": args.caps or None,
             "max_usd": args.max_usd,
+            "coverage_audit": args.coverage_audit,
         },
         "command": ["python", "-m", "evals.external_benchmarks", *argv],
         "time": {"started": _iso(started), "finished": _iso(finished),
@@ -2550,6 +2552,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="what decides at question time: the store's provider (store, "
                              "the default), none, or Jev (TYPESAFE_API_KEY); given several "
                              "times, every question is asked once per value")
+    parser.add_argument("--coverage-audit", action="store_true",
+                        help="run the second pass after each save (llm.coverage_audit). It only writes a warning for the saving agent and changes no answer, so a benchmark skips it unless this is given")
     parser.add_argument("--question-keys", choices=["config", "on", "both"], default="config",
                         help="question keys (retrieval.question_keys): on writes them at "
                              "ingest and reads them; both also asks every pass a second "
@@ -2713,6 +2717,7 @@ def _write_json(path: pathlib.Path, data: Any) -> None:
 #: Options that do not change a conversation's results: a per-conversation
 #: file written under other values of these is still reused.
 _RUN_ONLY = ("jobs", "results_dir", "out", "worker", "usage_db", "max_calls", "caps", "max_usd",
+             "coverage_audit",
              "prices", "conversation", "limit", "seed", "sample", "workers", "store_dir",
              "export_mem0", "export_longmemeval", "k_list", "category_set")
 
@@ -2782,6 +2787,9 @@ def write_selected(dataset: str, path: pathlib.Path, conversations: list[Convers
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    if not args.coverage_audit:
+        # no agent reads the second pass's warning here; worker processes inherit this
+        os.environ["MEMRY_COVERAGE_AUDIT"] = "0"
     started = time.time()
     try:
         prices = load_prices(args.prices)

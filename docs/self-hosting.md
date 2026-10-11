@@ -376,12 +376,13 @@ Two numbers are not obvious, so both were measured rather than guessed. The data
 harnesses are in `evals/` if you want to re-run them against your own data, which is the
 only way to know whether these hold for your store.
 
-**The automatic-merge gate** (`Decider.auto_confirm_confidence`) is 0.70 with Jev, and
-would be 0.95 for gpt-5-mini as the text model. It is a property of the model because
-the number only means something relative to how that model's confidence is spread: a model
-reporting a number about itself scores its wrong answers about as high as its right ones,
-so the gate has to sit high and little gets automated. Override with
-`MEMRY_DECISION_MERGE_CONFIDENCE`.
+**The merge bars** (`JevDecider.pair_merge_by_step`) depend on how many memories the
+smaller side has: 0.97 at one, 0.96 at three, 0.85 at ten and 0.80 at fifty. Each bar is
+the lowest P(same) that kept wrong merges at 2% of merges or fewer, in the stricter of two
+sets of synthetic stores with exact labels (18,885 comparisons). The stats panel still
+shows one gate of 0.70 (`Decider.auto_confirm_confidence`, set with
+`MEMRY_DECISION_MERGE_CONFIDENCE`), an older measurement on 56 labelled cases. No merge
+reads it.
 
 **A text model does not decide identity.** On the same 56 cases, gpt-5.6-luna got 52
 verdicts safe, better than gpt-5-mini's 49, and put its worst wrong "same" at 0.98, above

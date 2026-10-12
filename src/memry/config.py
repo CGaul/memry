@@ -44,7 +44,7 @@ DecisionProvider = Literal["none", "llm", "jev"]
 #: model's confidence, so Memry never merges entities on it alone (see
 #: providers/decisions.py); it sends those questions to the decision model.
 DEFAULT_LLM_MODELS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5",
+    "anthropic": "claude-haiku-5-5",
     "openai": "gpt-6-luna",
     "ollama": "llama3.1",
 }

@@ -485,7 +485,7 @@ For local single-machine use, prefer stdio (`memry mcp`) - no port, no auth surf
 
 | Goal | Setting |
 |---|---|
-| Default Anthropic extraction | `ANTHROPIC_API_KEY` + `pip install "memry[anthropic]"` (defaults to the fast, lower-cost `claude-haiku-4-5`) |
+| Default Anthropic extraction | `ANTHROPIC_API_KEY` + `pip install "memry[anthropic]"` (defaults to the fast, lower-cost `claude-haiku-5-5`) |
 | Larger Anthropic model | `MEMRY_LLM_MODEL=claude-opus-4-8` (explicitly trades more latency and cost for extraction quality) |
 | OpenAI end-to-end | `OPENAI_API_KEY` (LLM `gpt-6-luna`, embeddings `text-embedding-3-small`) |
 | Previous OpenAI default | `MEMRY_LLM_MODEL=gpt-5.6-luna` (measured for re-ranking, with gpt-5-mini) |

@@ -1,10 +1,17 @@
-"""Memry on published long-term-memory benchmarks: LoCoMo and LongMemEval.
+"""Memry on published long-term-memory benchmarks: LoCoMo, LongMemEval and BEAM.
 
 LoCoMo (Maharana et al. 2024, ``locomo10.json``): long conversations between
 two people over many dated sessions, each with a few hundred questions whose
 evidence is named by turn ("D3:7"). LongMemEval (Wu et al. 2024,
 ``longmemeval_s.json``, ``_m``, ``_oracle``): questions that each come with
 their own haystack of dated chat sessions; the evidence is named by session.
+BEAM (Tavakoli et al. 2026, ``beam_100K.json``, ``_500K``, ``_1M``, written
+by ``python -m evals.beam_eval fetch``): long chats between a user and an
+assistant in dated batches, 20 questions a chat over ten abilities, each
+graded against its rubric by ``evals.beam_eval`` (see there); the evidence
+is named by message. A batch is cut into sessions of whole exchanges (a
+user's question with the replies up to the next one) of at most
+``BEAM_SESSION_CHARS`` characters, all dated the batch's time anchor.
 
 Each conversation (a LoCoMo sample; a LongMemEval question with its haystack)
 goes into a fresh in-memory store through ``MemoryStore.add``:
@@ -188,7 +195,7 @@ from memry.providers.llm import LLM, NoneLLM, build_llm  # noqa: E402
 from memry.store import MemoryStore  # noqa: E402
 
 DATA_ENV = "MEMRY_BENCH_DATA"
-DATASETS = ("locomo", "longmemeval")
+DATASETS = ("locomo", "longmemeval", "beam")
 BENCH_USER = "bench"
 KS = (5, 10, 20)
 DEPTH = max(KS)
@@ -297,6 +304,8 @@ _LOCOMO_DATE = re.compile(
 _DAY_MONTH_YEAR = re.compile(r"^(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})$")
 # "May 8, 2023"
 _MONTH_DAY_YEAR = re.compile(r"^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$")
+# "March-15-2024" (BEAM's time anchors)
+_MONTH_DAY_YEAR_DASHED = re.compile(r"^([A-Za-z]+)-(\d{1,2})-(\d{4})$")
 # "2023/05/20 (Sat) 02:21" (LongMemEval)
 _SLASH_DATE = re.compile(
     r"^(\d{4})/(\d{1,2})/(\d{1,2})(?:\s*\([A-Za-z]+\))?(?:\s+(\d{1,2}):(\d{2}))?$")
@@ -320,7 +329,7 @@ def parse_bench_date(text: Any) -> datetime | None:
         if m := _DAY_MONTH_YEAR.match(text):
             day, month, year = m.groups()
             return datetime(int(year), _MONTHS[month.lower()], int(day), tzinfo=timezone.utc)
-        if m := _MONTH_DAY_YEAR.match(text):
+        if m := _MONTH_DAY_YEAR.match(text) or _MONTH_DAY_YEAR_DASHED.match(text):
             month, day, year = m.groups()
             return datetime(int(year), _MONTHS[month.lower()], int(day), tzinfo=timezone.utc)
         parsed = datetime.fromisoformat(text)
@@ -534,8 +543,144 @@ def _longmemeval_item(item: Any, index: int) -> Conversation:
                         warnings)
 
 
+#: Most characters of one BEAM session (about 2,500 tokens): a batch runs to
+#: 40,000 tokens and more, so it is cut, at the start of an exchange, into
+#: sessions near the size of LongMemEval's, which one extraction reads whole.
+BEAM_SESSION_CHARS = 10_000
+#: A run of this many blanks in a BEAM message is read as one space: one
+#: assistant message of the 100K chats is 348,853 characters, 322,493 of them
+#: in such runs, a broken generation in the data rather than anything said.
+_BEAM_PADDING = re.compile(r"[ \t]{200,}")
+#: The abilities BEAM asks about, in the order of its results tables.
+BEAM_ABILITIES = ("abstention", "contradiction_resolution", "event_ordering",
+                  "information_extraction", "instruction_following", "knowledge_update",
+                  "multi_session_reasoning", "preference_following", "summarization",
+                  "temporal_reasoning")
+#: Where each ability keeps its reference answer, which f1 and "contains" read.
+_BEAM_GOLD = ("answer", "ideal_answer", "ideal_response", "ideal_summary",
+              "expected_compliance")
+
+
+def load_beam(path: str | os.PathLike[str]) -> list[Conversation]:
+    """BEAM chats, each a conversation with its 20 questions: the file
+    ``evals.beam_eval fetch`` writes (a list of rows), or a page of the
+    Hugging Face datasets server (``{"rows": [{"row": ...}]}``). Raises
+    FormatError on a shape it cannot read."""
+    data = _read_json(path)
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        data = [r.get("row") if isinstance(r, dict) else r for r in data["rows"]]
+    if not isinstance(data, list):
+        raise FormatError(f"{path}: expected a list of BEAM chats")
+    return [_beam_chat(row, i) for i, row in enumerate(data)]
+
+
+def _beam_exchanges(batch: list[Any], where: str) -> list[list[dict[str, Any]]]:
+    """A batch's messages in exchanges: each user question that BEAM marks
+    "main_question", with every message after it up to the next one."""
+    exchanges: list[list[dict[str, Any]]] = []
+    for t, message in enumerate(batch):
+        if not isinstance(message, dict):
+            raise FormatError(f"{where} message {t}: not an object")
+        if message.get("question_type") == "main_question" or not exchanges:
+            exchanges.append([])
+        exchanges[-1].append(message)
+    return exchanges
+
+
+def _beam_chat(row: Any, index: int) -> Conversation:
+    if not isinstance(row, dict):
+        raise FormatError(f"chat {index}: not an object")
+    conv_id = f"beam-{row.get('conversation_id') or index}"
+    batches = row.get("chat")
+    if not isinstance(batches, list) or not all(isinstance(b, list) for b in batches):
+        raise FormatError(f"{conv_id}: 'chat' is not a list of batches")
+    warnings: list[str] = []
+    sessions: list[Session] = []
+    keys: set[str] = set()
+    for b, batch in enumerate(batches, start=1):
+        anchor = next((m.get("time_anchor") for m in batch
+                       if isinstance(m, dict) and m.get("time_anchor")), "")
+        date = parse_bench_date(anchor)
+        if date is None:
+            warnings.append(f"{conv_id} batch {b}: no readable time anchor ({anchor!r})")
+        parts: list[list[Turn]] = [[]]
+        size = 0
+        for exchange in _beam_exchanges(batch, f"{conv_id} batch {b}"):
+            turns = []
+            for message in exchange:
+                role = str(message.get("role") or "user").strip().lower()
+                content = _BEAM_PADDING.sub(" ", str(message.get("content") or "")).strip()
+                if not content:
+                    continue
+                if role not in ("user", "assistant"):
+                    warnings.append(f"{conv_id} message {message.get('id')}: role {role!r} "
+                                    "read as user")
+                    role = "user"
+                key = f"{conv_id}#{message.get('id')}"
+                if key in keys:
+                    raise FormatError(f"{conv_id}: message id {message.get('id')} appears twice")
+                keys.add(key)
+                turns.append(Turn(key=key, role=role, raw=content,
+                                  text=content if role == "user" else f"{role}: {content}"))
+            if parts[-1] and size + sum(len(t.raw) for t in turns) > BEAM_SESSION_CHARS:
+                parts.append([])
+                size = 0
+            for turn in turns:
+                # an exchange longer than a session is cut between its messages
+                if parts[-1] and size + len(turn.raw) > BEAM_SESSION_CHARS:
+                    parts.append([])
+                    size = 0
+                parts[-1].append(turn)
+                size += len(turn.raw)
+        for p, turns in enumerate(p for p in parts if p):
+            sessions.append(Session(f"b{b}s{p + 1}", date, str(anchor or ""), turns))
+    last = next((s.date for s in reversed(sessions) if s.date), None)
+    questions = _beam_questions(row.get("probing_questions"), conv_id, keys, last, warnings)
+    return Conversation(conv_id, "chat between the user and an assistant", sessions, questions,
+                        warnings)
+
+
+def _beam_questions(raw: Any, conv_id: str, keys: set[str], asked_on: datetime | None,
+                    warnings: list[str]) -> list[Question]:
+    if isinstance(raw, str):
+        import ast
+
+        try:
+            raw = ast.literal_eval(raw)
+        except (SyntaxError, ValueError) as exc:
+            raise FormatError(f"{conv_id}: probing_questions unreadable ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise FormatError(f"{conv_id}: probing_questions is not a mapping of abilities")
+    questions = []
+    for ability in [a for a in BEAM_ABILITIES if a in raw] + \
+            sorted(a for a in raw if a not in BEAM_ABILITIES):
+        for i, item in enumerate(raw[ability] or []):
+            qid = f"{conv_id}/{ability}/{i}"
+            if not isinstance(item, dict) or not str(item.get("question") or "").strip():
+                raise FormatError(f"{qid}: no question")
+            rubric = item.get("rubric")
+            if not isinstance(rubric, list) or not rubric:
+                raise FormatError(f"{qid}: no rubric")
+            ids = re.findall(r"\d+", json.dumps(item.get("source_chat_ids") or []))
+            evidence, unknown = [], []
+            for x in ids:
+                (evidence if f"{conv_id}#{x}" in keys else unknown).append(f"{conv_id}#{x}")
+            if unknown:
+                warnings.append(f"{qid}: evidence messages {unknown} are not in the chat")
+            gold = next((item[f] for f in _BEAM_GOLD if item.get(f)), "")
+            questions.append(Question(
+                qid=qid, question=_text(item["question"]), answer=_text(gold),
+                category=ability, category_name=ability,
+                evidence=list(dict.fromkeys(evidence)), level="turn",
+                question_date=asked_on, abstain=ability == "abstention",
+                extra={"rubric": [str(r) for r in rubric], "beam_ability": ability,
+                       "beam_index": i, "difficulty": item.get("difficulty")},
+                reference_date=asked_on.isoformat() if asked_on else None))
+    return questions
+
+
 LOADERS: dict[str, Callable[[Any], list[Conversation]]] = {
-    "locomo": load_locomo, "longmemeval": load_longmemeval,
+    "locomo": load_locomo, "longmemeval": load_longmemeval, "beam": load_beam,
 }
 
 
@@ -544,6 +689,9 @@ def dataset_files(dataset: str, variant: str = "s") -> list[str]:
     if dataset == "locomo":
         names = ["locomo10.json"]
         dirs = ["", "locomo/", "locomo/data/", "data/"]
+    elif dataset == "beam":
+        names = [f"beam_{variant}.json"]
+        dirs = ["", "beam/", "BEAM/", "data/"]
     else:
         names = [f"longmemeval_{variant}.json", f"longmemeval_{variant}_cleaned.json",
                  f"longmemeval_{variant}"]
@@ -1826,8 +1974,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--file", default=None,
                         help=f"the dataset file (relative paths start at ${DATA_ENV}); "
                              "default: the usual file name there")
-    parser.add_argument("--variant", default="s", choices=["s", "m", "oracle"],
-                        help="LongMemEval file: longmemeval_<variant>.json (default s)")
+    parser.add_argument("--variant", default=None,
+                        choices=["s", "m", "oracle", "100K", "500K", "1M"],
+                        help="LongMemEval file: longmemeval_<variant>.json (default s); "
+                             "BEAM size: beam_<variant>.json (default 100K)")
     parser.add_argument("--ingest", choices=INGEST_MODES, default="verbatim")
     parser.add_argument("--extract-unit", choices=EXTRACT_UNITS, default="session",
                         help="with --ingest extract: one save a session (default) or a turn")
@@ -1860,7 +2010,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="also write the headline answers as Mem0's per-question "
                              "results file (evals/mem0_judge.export_results)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="first N conversations (LoCoMo samples, LongMemEval questions)")
+                        help="first N conversations (LoCoMo samples, LongMemEval questions, "
+                             "BEAM chats)")
     parser.add_argument("--conversation", action="append", default=None, metavar="ID",
                         help="only this conversation (a LoCoMo sample_id, a LongMemEval "
                              "question_id); may be given several times")
@@ -1920,6 +2071,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", default=None,
                         help=f"results file (default ${DATA_ENV}/results/<dataset>_<time>.json)")
     args = parser.parse_args(argv)
+    beam_sizes = ("100K", "500K", "1M")
+    if args.variant is None:
+        args.variant = "100K" if args.dataset == "beam" else "s"
+    elif (args.dataset == "beam") != (args.variant in beam_sizes):
+        parser.error(f"--variant {args.variant} does not go with --dataset {args.dataset}")
     if args.jobs > 1 and not args.results_dir:
         parser.error("--jobs needs --results-dir")
     if args.max_calls and not args.usage_db:
@@ -2190,7 +2346,7 @@ def main(argv: list[str] | None = None) -> int:
         def finish(part: dict[str, Any]) -> dict[str, Any]:
             part["file"] = str(path)
             part["config"].update(limit=args.limit, seed=args.seed, options=options,
-                                  variant=args.variant if args.dataset == "longmemeval" else None)
+                                  variant=args.variant if args.dataset != "locomo" else None)
             part["notes"] = notes + part["notes"]
             return part
 

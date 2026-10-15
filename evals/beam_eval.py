@@ -1,0 +1,540 @@
+"""BEAM (Tavakoli et al., "Beyond a Million Tokens", ICLR 2026) for Memry.
+
+``evals.external_benchmarks --dataset beam`` loads each chat into a store and
+answers its 20 questions; this module holds what is BEAM's own:
+
+  fetch    the chats and questions of one size from the Hugging Face datasets
+           server, written as $MEMRY_BENCH_DATA/beam_<size>.json; a cell the
+           server shortened stops the fetch, so the file is the data whole
+  answer   ``answer_messages``: BEAM's answering prompt for retrieval
+           (``answer_generation_for_rag``), Memry's context in its place of
+           the retrieved chunks; pass it as --answer-prompt
+  grade    BEAM's grader over a results file: every rubric item of a
+           question is scored 0, 0.5 or 1 by the judge model with BEAM's
+           ``unified_llm_judge_base_prompt``, and the question scores their
+           mean; an event-ordering answer is also scored by Kendall's tau-b
+           against the rubric's order, its lines matched to the rubric's
+           items by the judge model (``llm_equivalence``), as BEAM's
+           ``event_ordering_score`` does
+
+The tables follow BEAM's ``report_results.py``: per chat and ability the mean
+question score (event ordering: the normalised tau, ``tau_norm``), then the
+mean over chats, and the overall score is the mean of the ten abilities.
+Beside it: the same with event ordering by its rubric (as SurrealDB's
+"rubric average"), the share of questions with every rubric item at 1
+("strict"), and the share scoring at least 0.5 ("pass").
+
+The prompts and the scoring are BEAM's (github.com/mohammadtavakoli78/BEAM,
+src/prompts.py and src/evaluation/compute_metrics.py, MIT License, Copyright
+(c) 2025 Mohammad Tavakoli). BEAM's grader uses gpt-4.1-mini at temperature 0;
+so does this one unless --judge-model says otherwise.
+
+    python -m evals.beam_eval fetch --size 100K
+    MEMRY_BENCH_DATA=/data .venv/bin/python -m evals.external_benchmarks --dataset beam \\
+        --variant 100K --ingest extract --embedder openai --decider jev --k 20 \\
+        --answer-model gpt-4o-mini --compare-answer-model gpt-6-luna \\
+        --answer-prompt evals.beam_eval:answer_messages ...
+    python -m evals.beam_eval grade RESULTS.json [more ...] --out beam_scores.json \\
+        --max-dollars 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import statistics
+import sys
+import threading
+import time
+from collections import defaultdict
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+HERE = pathlib.Path(__file__).resolve().parent
+if str(HERE.parent) not in sys.path:
+    sys.path.insert(0, str(HERE.parent))
+
+ABILITIES = ("abstention", "contradiction_resolution", "event_ordering",
+             "information_extraction", "instruction_following", "knowledge_update",
+             "multi_session_reasoning", "preference_following", "summarization",
+             "temporal_reasoning")
+SIZES = ("100K", "500K", "1M")
+DATASET = "Mohammadta/BEAM"
+ROWS_URL = "https://datasets-server.huggingface.co/rows"
+JUDGE_MODEL = "gpt-4.1-mini"
+#: USD per million tokens, input and output (OpenAI's list prices).
+PRICES = {"gpt-4.1-mini": (0.40, 1.60), "gpt-4o-mini": (0.15, 0.60), "gpt-6-luna": (0.10, 0.50)}
+
+# ---------------------------------------------------------------- BEAM's prompts, verbatim
+
+ANSWER_PROMPT = (
+    '\n'
+    'You are an assistant that MUST answer questions using ONLY the information provided in the context below. \n'
+    '\n'
+    'STRICT INSTRUCTIONS:\n'
+    '1. Answer ONLY based on the provided context\n'
+    '2. Do NOT use your internal knowledge\n'
+    '\n'
+    'CONTEXT:\n'
+    '<context>\n'
+    '\n'
+    'QUESTION:\n'
+    '<question>\n'
+    '\n'
+    'ANSWER REQUIREMENTS:\n'
+    '- Be direct and concise\n'
+    '- Only output the answer to the question without any explanation \n'
+    '\n'
+    'RESPONSE:\n'
+)
+
+JUDGE_PROMPT = (
+    '\n'
+    "You are an expert evaluator tasked with judging whether the LLM's response demonstrates compliance with the specified RUBRIC CRITERION.\n"
+    '\n'
+    '## EVALUATION INPUTS\n'
+    '- RUBRIC CRITERION (what to check): <rubric_item>\n'
+    '- RESPONSE TO EVALUATE: <llm_response>\n'
+    '\n'
+    '## EVALUATION RUBRIC:\n'
+    'The rubric defines a specific requirement, constraint, or expected behavior that the LLM response should demonstrate. \n'
+    '\n'
+    '**IMPORTANT**: Pay careful attention to whether the rubric specifies:\n'
+    '- **Positive requirements** (things the response SHOULD include/do)\n'
+    '- **Negative constraints** (things the response SHOULD NOT include/do, often indicated by "no", "not", "avoid", "absent")\n'
+    '\n'
+    '## RESPONSIVENESS REQUIREMENT\n'
+    'A compliant response must be **on-topic** and attempt to answer it.\n'
+    '- If the response does not address the QUESTION, score **0.0** and stop.\n'
+    '- For negative constraints, both must hold: (a) the response is responsive to the QUESTION, and (b) the prohibited element is absent.\n'
+    '\n'
+    '## SEMANTIC TOLERANCE RULES:\n'
+    'Judge by meaning, not exact wording.\n'
+    '- Accept **paraphrases** and **synonyms** that preserve intent.\n'
+    '- **Case/punctuation/whitespace** differences must be ignored.\n'
+    '- **Numbers/currencies/dates** may appear in equivalent forms (e.g., “$68,000”, “68k”, “68,000 USD”, or “sixty-eight thousand dollars”). Treat them as equal when numerically equivalent.\n'
+    '- If the rubric expects a number or duration, prefer **normalized comparison** (extract and compare values) over string matching.\n'
+    '\n'
+    '## STYLE NEUTRALITY (prevents style contamination):\n'
+    'Ignore tone, politeness, length, and flourish unless the rubric explicitly requires a format/structure (e.g., “itemized list”, “no citations”, “one sentence”).\n'
+    '- Do **not** penalize hedging, voice, or verbosity if content satisfies the rubric.\n'
+    '- Only evaluate format when the rubric **explicitly** mandates it.\n'
+    '\n'
+    '## SCORING SCALE:\n'
+    '- **1.0 (Complete Compliance)**: Fully complies with the rubric criterion.\n'
+    '  - Positive: required element present, accurate, properly executed (allowing semantic equivalents).\n'
+    '  - Negative: prohibited element **absent** AND response is **responsive**.\n'
+    '  \n'
+    '- **0.5 (Partial Compliance)**: Partially complies.\n'
+    '  - Positive: element present but minor inaccuracies/incomplete execution.\n'
+    '  - Negative: generally responsive and mostly avoids the prohibited element but with minor/edge violations.\n'
+    '  \n'
+    '- **0.0 (No Compliance)**: Fails to comply.\n'
+    '  - Positive: required element missing or incorrect.\n'
+    '  - Negative: prohibited element present **or** response is non-responsive/evasive even if the element is absent.\n'
+    '\n'
+    '## EVALUATION INSTRUCTIONS:\n'
+    '1. **Understand the Requirement**: Determine if the rubric is asking for something to be present (positive) or absent (negative/constraint).\n'
+    '\n'
+    '2. **Parse Compound Statements**: If the rubric contains multiple elements connected by "and" or commas, evaluate whether:\n'
+    '   - **All elements** must be present for full compliance (1.0)\n'
+    '   - **Some elements** present indicates partial compliance (0.5)\n'
+    '   - **No elements** present indicates no compliance (0.0)\n'
+    '   \n'
+    '3. **Check Compliance**: \n'
+    '   - For positive requirements: Look for the presence and quality of the required element\n'
+    '   - For negative constraints: Look for the absence of the prohibited element\n'
+    '\n'
+    '4. **Assign Score**: Based on compliance with the specific rubric criterion according to the scoring scale above.\n'
+    '\n'
+    '5. **Provide Reasoning**: Explain whether the rubric criterion was satisfied and justify the score.\n'
+    '\n'
+    '## OUTPUT FORMAT:\n'
+    'Return your evaluation in JSON format with two fields:\n'
+    '\n'
+    '{\n'
+    '   "score": [your score: 1.0, 0.5, or 0.0],\n'
+    '   "reason": "[detailed explanation of whether the rubric criterion was satisfied and why this justified the assigned score]"\n'
+    '}\n'
+    '\n'
+    'NOTE: ONLY output the json object, without any explanation before or after that\n'
+)
+
+EQUIVALENCE_SYSTEM = """
+            You are a binary classifier.
+            If the TWO snippets describe the SAME event/fact, reply **YES**
+            Otherwise reply **NO**. No extra words.
+            DO NOT provide any exaplanation.
+        """
+
+
+#: BEAM's user turn of the equivalence call (an f-string there)
+EQUIVALENCE_USER = (
+    'First snippet: {first} \n'
+    '\n'
+    '                       Second snippet: {second}\n'
+    '                    '
+)
+
+
+# ---------------------------------------------------------------- answering
+
+def context_of(items: list[Any]) -> str:
+    """Memry's lines for the question, as its context builder renders them."""
+    return "\n".join(item if isinstance(item, str) else str(getattr(item, "content", item))
+                     for item in items)
+
+
+def answer_messages(question: str, items: list[Any]) -> list[dict[str, str]]:
+    """BEAM's answering call for retrieval: one user message, its context Memry's."""
+    prompt = ANSWER_PROMPT.replace("<context>", context_of(items)).replace("<question>", question)
+    return [{"role": "user", "content": prompt}]
+
+
+answer_messages.context_of = context_of  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------- fetching
+
+def fetch(size: str, out: pathlib.Path, *, page: int = 5,
+          get: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Every row of one size, whole, as a JSON list at ``out``."""
+    if get is None:
+        import httpx
+
+        client = httpx.Client(timeout=300)
+
+        def get(params: dict[str, Any]) -> dict[str, Any]:
+            resp = client.get(ROWS_URL, params=params)
+            resp.raise_for_status()
+            return resp.json()
+
+    rows: list[dict[str, Any]] = []
+    total = None
+    while total is None or len(rows) < total:
+        data = get({"dataset": DATASET, "config": "default", "split": size,
+                    "offset": len(rows), "length": page})
+        total = int(data["num_rows_total"])
+        batch = data.get("rows") or []
+        if not batch:
+            raise RuntimeError(f"the server stopped at row {len(rows)} of {total}")
+        for item in batch:
+            if item.get("truncated_cells"):
+                raise RuntimeError(f"row {item.get('row_idx')}: the server shortened "
+                                   f"{item['truncated_cells']}; read the parquet file instead")
+            rows.append(item["row"])
+    text = json.dumps(rows, ensure_ascii=False)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    return {"rows": len(rows), "path": str(out),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+
+# ---------------------------------------------------------------- grading
+
+class Budget:
+    """Dollars spent by the judge model, from the usage each reply reports;
+    ``charge`` raises once the total passes ``cap``."""
+
+    def __init__(self, model: str, cap: float | None) -> None:
+        self.price = PRICES.get(model)
+        self.cap = cap
+        self.dollars = 0.0
+        self.calls = 0
+        self.tokens = [0, 0]
+        self._lock = threading.Lock()
+
+    def charge(self, usage: dict[str, Any] | None) -> None:
+        usage = usage or {}
+        tin, tout = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+        with self._lock:
+            self.calls += 1
+            self.tokens[0] += tin
+            self.tokens[1] += tout
+            if self.price:
+                self.dollars += (tin * self.price[0] + tout * self.price[1]) / 1e6
+            if self.cap is not None and self.dollars > self.cap:
+                raise CapReached(f"${self.dollars:.2f} of judge calls passes the cap of "
+                                 f"${self.cap:.2f}")
+
+
+class CapReached(RuntimeError):
+    pass
+
+
+def parse_score(text: str) -> float | None:
+    """The "score" of the judge's JSON reply, as BEAM's parser and its
+    json_repair fallback read it; None when there is none."""
+    text = text.strip()
+    if text.startswith("```"):
+        found = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+        text = found.group(1) if found else text
+    for candidate in (text, *re.findall(r"\{.*?\}", text, re.S)):
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, dict) and "score" in value:
+                return float(value["score"])
+        except (ValueError, TypeError):
+            continue
+    found = re.search(r'"?score"?\s*:\s*\[?\s*"?([01](?:\.\d+)?|0?\.5)', text)
+    return float(found.group(1)) if found else None
+
+
+Chat = Callable[[list[dict[str, str]]], tuple[str, dict[str, Any] | None]]
+
+
+def openai_chat(model: str) -> Chat:
+    from evals.mem0_judge import OpenAIChat
+
+    llm = OpenAIChat(model)
+
+    def chat(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any] | None]:
+        return llm.chat(messages), llm.last_usage()
+
+    return chat
+
+
+def judge_item(chat: Chat, budget: Budget, item: str, response: str) -> dict[str, Any]:
+    prompt = JUDGE_PROMPT.replace("<rubric_item>", item).replace("<llm_response>", response)
+    for attempt in range(2):
+        text, usage = chat([{"role": "user", "content": prompt}])
+        budget.charge(usage)
+        score = parse_score(text or "")
+        if score is not None:
+            return {"score": score, "reply": text}
+    return {"score": 0.0, "reply": text, "error": "no score in the reply"}
+
+
+def equivalent(chat: Chat, budget: Budget, first: str, second: str) -> bool:
+    text, usage = chat([{"role": "system", "content": EQUIVALENCE_SYSTEM},
+                        {"role": "user", "content": EQUIVALENCE_USER.format(first=first, second=second)}])
+    budget.charge(usage)
+    return "yes" in (text or "").lower()
+
+
+def kendall_tau_b(x: list[int], y: list[int]) -> float | None:
+    """Kendall's tau-b of two rankings (scipy.stats.kendalltau, variant "b")."""
+    concordant = discordant = ties_x = ties_y = 0
+    n = len(x)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx, dy = x[i] - x[j], y[i] - y[j]
+            if dx == 0 and dy == 0:
+                continue
+            if dx == 0:
+                ties_x += 1
+            elif dy == 0:
+                ties_y += 1
+            elif (dx > 0) == (dy > 0):
+                concordant += 1
+            else:
+                discordant += 1
+    denominator = ((concordant + discordant + ties_x) * (concordant + discordant + ties_y)) ** 0.5
+    return (concordant - discordant) / denominator if denominator else None
+
+
+def event_order(chat: Chat, budget: Budget, reference: list[str], response: str) -> dict[str, Any]:
+    """BEAM's ``event_ordering_score`` with ``align_type="llm"``: each line of
+    the answer takes the first unused rubric item the judge model calls the
+    same event, and the order is scored over the union of both lists."""
+    system = response.split("\n")
+    used: set[int] = set()
+    canon: list[str] = []
+    for line in system:
+        match = next((i for i, ref in enumerate(reference)
+                      if i not in used and equivalent(chat, budget, ref, line)), None)
+        if match is None:
+            canon.append(line)
+        else:
+            canon.append(reference[match])
+            used.add(match)
+    tp = len(set(reference) & set(canon))
+    fp = len([x for x in canon if x not in reference])
+    fn = len([x for x in reference if x not in canon])
+    precision = tp / (tp + fp) if tp + fp else 0
+    recall = tp / (tp + fn) if tp + fn else 0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0
+    union = list(dict.fromkeys(reference + canon))
+    tie = len(union) + 1
+
+    def ranks(seq: list[str]) -> list[int]:
+        rank = {item: i + 1 for i, item in enumerate(seq)}
+        return [rank.get(u, tie) for u in union]
+
+    tau = kendall_tau_b(ranks(reference), ranks(canon))
+    tau_norm = (tau + 1) / 2 if tau is not None else 0
+    return {"precision": precision, "recall": recall, "f1": f1, "tau_norm": tau_norm,
+            "final_score": tau_norm * f1}
+
+
+def grade_answer(chat: Chat, budget: Budget, ability: str, rubric: list[str],
+                 response: str) -> dict[str, Any]:
+    items = [judge_item(chat, budget, item, response) for item in rubric]
+    scores = [i["score"] for i in items]
+    out: dict[str, Any] = {"llm_judge_score": sum(scores) / len(scores), "item_scores": scores,
+                           "replies": [i["reply"] for i in items]}
+    if any("error" in i for i in items):
+        out["errors"] = sum("error" in i for i in items)
+    if ability == "event_ordering":
+        out.update(event_order(chat, budget, rubric, response))
+    return out
+
+
+def official(grade: dict[str, Any], ability: str) -> float:
+    """The question's score in BEAM's report: event ordering by tau_norm."""
+    return grade["tau_norm"] if ability == "event_ordering" else grade["llm_judge_score"]
+
+
+def answers_of(row: dict[str, Any]) -> Iterable[tuple[str, str]]:
+    """(variant, prediction) of each answer a results row carries."""
+    if row.get("prediction") is not None:
+        yield "answer", str(row["prediction"])
+    for at, answer in sorted((row.get("answers_compared") or {}).items()):
+        if answer.get("prediction") is not None:
+            yield f"compared@{at}", str(answer["prediction"])
+
+
+def read_rows(paths: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    config: dict[str, Any] = {}
+    for spec in paths:
+        path = pathlib.Path(spec)
+        files = sorted(path.glob("*.json")) if path.is_dir() else [path]
+        for file in files:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            config = config or data.get("config") or {}
+            rows.extend(r for r in data.get("rows") or [] if r.get("rubric"))
+    return rows, config
+
+
+def tables(graded: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per answer variant: BEAM's report (per chat and ability, then over
+    chats; the overall mean of the abilities), with event ordering by its
+    rubric beside it, and the strict and pass shares."""
+    out: dict[str, Any] = {}
+    for variant in sorted({g["variant"] for g in graded}):
+        mine = [g for g in graded if g["variant"] == variant]
+        per: dict[str, dict[str, Any]] = {}
+        for kind, score_of in (("official", lambda g: official(g, g["ability"])),
+                               ("rubric", lambda g: g["llm_judge_score"])):
+            chats: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+            for g in mine:
+                chats[g["conversation"]][g["ability"]].append(score_of(g))
+            abilities = {}
+            for ability in ABILITIES:
+                means = [statistics.mean(c[ability]) for c in chats.values() if c.get(ability)]
+                if means:
+                    abilities[ability] = statistics.mean(means)
+            per[kind] = {"abilities": abilities,
+                         "overall": statistics.mean(abilities.values()) if abilities else None}
+        out[variant] = {
+            "n": len(mine), "chats": len({g["conversation"] for g in mine}),
+            "official": per["official"], "rubric_average": per["rubric"],
+            "strict": statistics.mean(all(s == 1.0 for s in g["item_scores"]) for g in mine),
+            "pass": statistics.mean(official(g, g["ability"]) >= 0.5 for g in mine),
+            "judge_errors": sum(g.get("errors", 0) for g in mine)}
+    return out
+
+
+def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL,
+          max_dollars: float | None = None, workers: int = 8,
+          chat: Chat | None = None) -> dict[str, Any]:
+    """Grade every answer of the results files; graded answers already in
+    ``out`` are kept, so an interrupted grading resumes."""
+    rows, config = read_rows(paths)
+    chat = chat or openai_chat(judge_model)
+    budget = Budget(judge_model, max_dollars)
+    done: dict[tuple[str, str], dict[str, Any]] = {}
+    if out.exists():
+        for g in json.loads(out.read_text(encoding="utf-8")).get("graded") or []:
+            done[(g["qid"], g["variant"])] = g
+    todo = [(row, variant, prediction) for row in rows
+            for variant, prediction in answers_of(row) if (row["qid"], variant) not in done]
+    lock = threading.Lock()
+    stopped: list[str] = []
+
+    def one(task: tuple[dict[str, Any], str, str]) -> None:
+        row, variant, prediction = task
+        if stopped:
+            return
+        try:
+            result = grade_answer(chat, budget, row["beam_ability"], row["rubric"], prediction)
+        except CapReached as exc:
+            stopped.append(str(exc))
+            return
+        with lock:
+            done[(row["qid"], variant)] = {
+                "qid": row["qid"], "conversation": row["conversation"],
+                "ability": row["beam_ability"], "variant": variant, **result}
+
+    started = time.time()
+    with ThreadPoolExecutor(max(1, workers)) as pool:
+        list(pool.map(one, todo))
+    graded = sorted(done.values(), key=lambda g: (g["qid"], g["variant"]))
+    result = {"judge_model": judge_model, "answer_model": config.get("answer_model"),
+              "compare_answer_model": config.get("compare_answer_model"),
+              "complete": not stopped and len(graded) == sum(1 for r in rows
+                                                              for _ in answers_of(r)),
+              "stopped": stopped[0] if stopped else None,
+              "judge_calls": budget.calls, "judge_tokens": budget.tokens,
+              "judge_dollars": round(budget.dollars, 6), "seconds": round(time.time() - started),
+              "tables": tables(graded), "graded": graded}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
+def markdown(result: dict[str, Any]) -> str:
+    lines = [f"judge {result['judge_model']}, ${result['judge_dollars']} this pass"]
+    for variant, t in result["tables"].items():
+        lines += ["", f"### {variant} ({t['n']} answers, {t['chats']} chats)", "",
+                  "| ability | BEAM's score | by rubric |", "|---|---|---|"]
+        for ability in ABILITIES:
+            a = t["official"]["abilities"].get(ability)
+            b = t["rubric_average"]["abilities"].get(ability)
+            if a is not None:
+                lines.append(f"| {ability} | {a:.3f} | {b:.3f} |")
+        lines += [f"| overall | {t['official']['overall']:.3f} | "
+                  f"{t['rubric_average']['overall']:.3f} |", "",
+                  f"strict {t['strict']:.3f}, pass {t['pass']:.3f}, "
+                  f"judge errors {t['judge_errors']}"]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m evals.beam_eval")
+    sub = parser.add_subparsers(dest="command", required=True)
+    f = sub.add_parser("fetch", help="download one size of BEAM")
+    f.add_argument("--size", choices=SIZES, default="100K")
+    f.add_argument("--out", default=None, help="default $MEMRY_BENCH_DATA/beam_<size>.json")
+    g = sub.add_parser("grade", help="grade a results file with BEAM's rubric judge")
+    g.add_argument("results", nargs="+", help="results files or a --results-dir")
+    g.add_argument("--out", required=True)
+    g.add_argument("--judge-model", default=JUDGE_MODEL)
+    g.add_argument("--max-dollars", type=float, default=None,
+                   help="stop once the judge calls have cost more than this many dollars")
+    g.add_argument("--workers", type=int, default=8)
+    args = parser.parse_args(argv)
+    if args.command == "fetch":
+        root = os.environ.get("MEMRY_BENCH_DATA", "").strip()
+        if not args.out and not root:
+            parser.error("--out or MEMRY_BENCH_DATA is needed")
+        out = pathlib.Path(args.out or pathlib.Path(root) / f"beam_{args.size}.json")
+        print(json.dumps(fetch(args.size, out)))
+        return 0
+    result = grade(args.results, pathlib.Path(args.out), judge_model=args.judge_model,
+                   max_dollars=args.max_dollars, workers=args.workers)
+    print(markdown(result))
+    if result["stopped"]:
+        print(f"stopped: {result['stopped']}", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,6 +9,11 @@ answers its 20 questions; this module holds what is BEAM's own:
   answer   ``answer_messages``: BEAM's answering prompt for retrieval
            (``answer_generation_for_rag``), Memry's context in its place of
            the retrieved chunks; pass it as --answer-prompt
+  answer   every question again, from the lines its first answer was shown
+           (a harness run with --keep-context), with another prompt
+           (``beam``: BEAM's; ``memry``: the harness's own short-answer
+           prompt; ``abilities``: ``ABILITIES_SYSTEM``) or another model,
+           through OpenAI or OpenRouter; no store is loaded again
   grade    BEAM's grader over a results file: every rubric item of a
            question is scored 0, 0.5 or 1 by the judge model with BEAM's
            ``unified_llm_judge_base_prompt``, and the question scores their
@@ -53,6 +58,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -68,7 +74,9 @@ DATASET = "Mohammadta/BEAM"
 ROWS_URL = "https://datasets-server.huggingface.co/rows"
 JUDGE_MODEL = "gpt-4.1-mini"
 #: USD per million tokens, input and output (OpenAI's list prices).
-PRICES = {"gpt-4.1-mini": (0.40, 1.60), "gpt-4o-mini": (0.15, 0.60), "gpt-6-luna": (0.10, 0.50)}
+PRICES = {"gpt-4.1-mini": (0.40, 1.60), "gpt-4o-mini": (0.15, 0.60), "gpt-6-luna": (0.10, 0.50),
+          "anthropic/claude-opus-5.5": (4.00, 20.00), "anthropic/claude-sonnet-5.5": (2.00, 10.00)}
+OPENROUTER_URL = "https://openrouter.ai/api"
 
 # ---------------------------------------------------------------- BEAM's prompts, verbatim
 
@@ -199,6 +207,73 @@ def answer_messages(question: str, items: list[Any]) -> list[dict[str, str]]:
 answer_messages.context_of = context_of  # type: ignore[attr-defined]
 
 
+#: An assistant answering from Memry's context, told what BEAM's README says
+#: each of its ten abilities asks of a memory (abstention, contradiction
+#: resolution, event ordering, information extraction, instruction following,
+#: knowledge update, multi-session reasoning, preference following,
+#: summarization, temporal reasoning). Written from that list alone, before
+#: any answer to it was read; nothing in it comes from BEAM's questions or
+#: rubrics.
+ABILITIES_SYSTEM = """You are a personal assistant with a long-term memory of your \
+past conversations with this user. Below the user's message is what your memory \
+returned for it: memories with the date each was said, and quoted parts of the \
+conversations they came from. Answer the user from this context.
+
+- If the context does not hold what the user asks about, say that you do not \
+know it. Do not guess.
+- If the user said contradictory things at different times and the context does \
+not show which one holds now, point out the contradiction, say both statements, \
+and ask which one is correct.
+- If a fact changed over time, answer with the latest value.
+- Follow the instructions and preferences the user gave earlier about how you \
+should answer (format, style, length, tools, level of detail), even when this \
+message does not repeat them.
+- When asked in what order things happened or were discussed, list them in that \
+order, one per line.
+- When asked for a summary, cover the main points across all the conversations \
+in the context.
+- For questions about time, work out the dates and durations from the dates in \
+the context.
+- When the answer needs facts from several conversations, combine them.
+
+Answer the way the user asked, completely but without padding."""
+
+
+def _today(reference_date: str | None) -> str:
+    try:
+        return f"Today is {datetime.fromisoformat(str(reference_date)):%d %B %Y}.\n"
+    except (TypeError, ValueError):
+        return ""
+
+
+def abilities_messages(question: str, items: list[Any],
+                       reference_date: str | None = None) -> list[dict[str, str]]:
+    """``ABILITIES_SYSTEM``, then the user's message with Memry's context."""
+    return [{"role": "system", "content": ABILITIES_SYSTEM},
+            {"role": "user", "content": f"{question}\n\n{_today(reference_date)}"
+                                        f"What your memory returned:\n{context_of(items)}"}]
+
+
+def memry_messages(question: str, items: list[Any],
+                   reference_date: str | None = None) -> list[dict[str, str]]:
+    """The harness's own answering call (``external_benchmarks.answer_question``),
+    which Memry's LoCoMo and LongMemEval runs use: a short phrase from the
+    memories, or "No information available"."""
+    from evals.external_benchmarks import ANSWER_SYSTEM, memories_text
+
+    return [{"role": "system", "content": ANSWER_SYSTEM},
+            {"role": "user", "content": f"{memories_text(items)}\n\n{_today(reference_date)}"
+                                        f"Question: {question}\nShort answer:"}]
+
+
+#: --prompt of ``answer``: (question, the lines Memry gave, reference date) -> messages.
+PROMPTS: dict[str, Callable[..., list[dict[str, str]]]] = {
+    "beam": lambda question, items, reference_date=None: answer_messages(question, items),
+    "memry": memry_messages,
+    "abilities": abilities_messages,
+}
+
+
 # ---------------------------------------------------------------- fetching
 
 def fetch(size: str, out: pathlib.Path, *, page: int = 5,
@@ -288,10 +363,16 @@ def parse_score(text: str) -> float | None:
 Chat = Callable[[list[dict[str, str]]], tuple[str, dict[str, Any] | None]]
 
 
-def openai_chat(model: str) -> Chat:
+def openai_chat(model: str, provider: str = "openai") -> Chat:
+    """A chat call through OpenAI, or through OpenRouter (``OPENROUTER_API_KEY``)
+    for the models it serves, such as anthropic/claude-opus-5.5."""
     from evals.mem0_judge import OpenAIChat
 
-    llm = OpenAIChat(model)
+    if provider == "openrouter":
+        llm = OpenAIChat(model, api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+                         base_url=OPENROUTER_URL, timeout=600)
+    else:
+        llm = OpenAIChat(model)
 
     def chat(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any] | None]:
         return llm.chat(messages), llm.last_usage()
@@ -494,6 +575,77 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
     return result
 
 
+def context_lines_of(row: dict[str, Any]) -> list[str] | None:
+    """The lines the row's headline answer was shown (``--keep-context``)."""
+    answer = (row.get("answers") or {}).get(str(row.get("answer_k")))
+    lines = (answer or {}).get("context_lines")
+    return list(lines) if isinstance(lines, list) else None
+
+
+def answer(paths: list[str], out: pathlib.Path, *, prompt: str, model: str,
+           provider: str = "openai", max_dollars: float | None = None, workers: int = 8,
+           chat: Chat | None = None) -> dict[str, Any]:
+    """Answer every question of the results files again, from the lines its
+    first answer was shown, with ``prompt`` and ``model``; written as a
+    results file ``grade`` reads. Answers already in ``out`` without an
+    error are kept, so an interrupted pass resumes."""
+    rows, config = read_rows(paths)
+    build = PROMPTS[prompt]
+    chat = chat or openai_chat(model, provider)
+    budget = Budget(model, max_dollars)
+    done: dict[str, dict[str, Any]] = {}
+    if out.exists():
+        for row in json.loads(out.read_text(encoding="utf-8")).get("rows") or []:
+            if not row.get("answer_error"):
+                done[row["qid"]] = row
+    keep = ("conversation", "qid", "category", "category_name", "beam_ability", "beam_index",
+            "difficulty", "question", "answer", "rubric", "evidence", "reference_date",
+            "recall@5", "recall@10", "recall@20", "answer_k", "context_tokens")
+    lock = threading.Lock()
+    stopped: list[str] = []
+
+    def one(row: dict[str, Any]) -> None:
+        if stopped or row["qid"] in done:
+            return
+        record = {key: row.get(key) for key in keep}
+        lines = context_lines_of(row)
+        started = time.perf_counter()
+        if lines is None:
+            record.update(prediction="", answer_error="no context_lines in the row "
+                                                      "(run the harness with --keep-context)")
+        else:
+            try:
+                text, usage = chat(build(row["question"], lines, row.get("reference_date")))
+                budget.charge(usage)
+                record.update(prediction=(text or "").strip(), usage=usage)
+            except CapReached as exc:
+                stopped.append(str(exc))
+                return
+            except Exception as exc:  # one failed call must not end the pass
+                record.update(prediction="", answer_error=f"{type(exc).__name__}: {exc}"[:300])
+        record["answer_seconds"] = round(time.perf_counter() - started, 3)
+        with lock:
+            done[row["qid"]] = record
+
+    started = time.time()
+    with ThreadPoolExecutor(max(1, workers)) as pool:
+        list(pool.map(one, rows))
+    answered = sorted(done.values(), key=lambda r: r["qid"])
+    result = {"config": {"answer_model": model, "answer_prompt": prompt, "provider": provider,
+                         "from": [str(p) for p in paths],
+                         "loaded_with": {k: config.get(k) for k in ("ingest", "decider", "k",
+                                                                    "embedder", "variant")}},
+              "complete": not stopped and len(answered) == len(rows),
+              "stopped": stopped[0] if stopped else None,
+              "failed": sum(bool(r.get("answer_error")) for r in answered),
+              "calls": budget.calls, "tokens": budget.tokens,
+              "dollars": round(budget.dollars, 6), "seconds": round(time.time() - started),
+              "rows": answered}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
 def markdown(result: dict[str, Any]) -> str:
     lines = [f"judge {result['judge_model']}, ${result['judge_dollars']} this pass, "
              f"{len(result.get('failed_answers') or [])} failed answers not graded"]
@@ -518,6 +670,15 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("fetch", help="download one size of BEAM")
     f.add_argument("--size", choices=SIZES, default="100K")
     f.add_argument("--out", default=None, help="default $MEMRY_BENCH_DATA/beam_<size>.json")
+    a = sub.add_parser("answer", help="answer again from the lines a run kept (--keep-context)")
+    a.add_argument("results", nargs="+", help="results files or a --results-dir")
+    a.add_argument("--out", required=True)
+    a.add_argument("--prompt", choices=sorted(PROMPTS), required=True)
+    a.add_argument("--model", required=True)
+    a.add_argument("--provider", choices=("openai", "openrouter"), default="openai")
+    a.add_argument("--max-dollars", type=float, default=None,
+                   help="stop once the answers have cost more than this many dollars")
+    a.add_argument("--workers", type=int, default=8)
     g = sub.add_parser("grade", help="grade a results file with BEAM's rubric judge")
     g.add_argument("results", nargs="+", help="results files or a --results-dir")
     g.add_argument("--out", required=True)
@@ -533,6 +694,13 @@ def main(argv: list[str] | None = None) -> int:
         out = pathlib.Path(args.out or pathlib.Path(root) / f"beam_{args.size}.json")
         print(json.dumps(fetch(args.size, out)))
         return 0
+    if args.command == "answer":
+        result = answer(args.results, pathlib.Path(args.out), prompt=args.prompt,
+                        model=args.model, provider=args.provider,
+                        max_dollars=args.max_dollars, workers=args.workers)
+        print(json.dumps({k: result[k] for k in ("complete", "stopped", "failed", "calls",
+                                                 "tokens", "dollars", "seconds")}))
+        return 3 if result["stopped"] else 0
     result = grade(args.results, pathlib.Path(args.out), judge_model=args.judge_model,
                    max_dollars=args.max_dollars, workers=args.workers)
     print(markdown(result))

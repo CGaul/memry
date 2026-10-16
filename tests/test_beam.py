@@ -319,3 +319,66 @@ def test_openai_chat_keeps_temperature_zero_where_it_is_taken():
     llm._client = httpx.Client(transport=httpx.MockTransport(handler))
     llm.chat([{"role": "user", "content": "hi"}])
     assert bodies[0]["temperature"] == 0.0
+
+
+def kept_row(qid="beam-7/summarization/0", lines=("15 March 2024: started the app",)):
+    return {"conversation": "beam-7", "qid": qid, "beam_ability": "summarization",
+            "rubric": ["has budget"], "question": "What did I start?", "answer": "the app",
+            "reference_date": "2024-04-25T00:00:00+00:00", "answer_k": 20,
+            "prediction": "old answer",
+            "answers": {"20": {"prediction": "old answer",
+                               **({"context_lines": list(lines)} if lines else {})}}}
+
+
+def test_prompts_build_each_answering_call():
+    lines = ["15 March 2024: started the app"]
+    [beam] = be.PROMPTS["beam"]("What did I start?", lines, "2024-04-25T00:00:00+00:00")
+    assert beam["role"] == "user" and "CONTEXT:\n15 March 2024: started the app" in beam["content"]
+    system, user = be.PROMPTS["abilities"]("What did I start?", lines, "2024-04-25T00:00:00+00:00")
+    assert system["content"] == be.ABILITIES_SYSTEM
+    assert user["content"].startswith("What did I start?\n\nToday is 25 April 2024.\n")
+    assert user["content"].endswith("15 March 2024: started the app")
+    system, user = be.PROMPTS["memry"]("What did I start?", lines, None)
+    assert system["content"] == xb.ANSWER_SYSTEM
+    assert user["content"] == ("Memories:\n- 15 March 2024: started the app\n\n"
+                               "Question: What did I start?\nShort answer:")
+
+
+def test_answer_writes_a_results_file_grade_reads(tmp_path):
+    rows = [kept_row(), kept_row("beam-7/summarization/1", lines=None)]
+    src = results_file(tmp_path / "r.json", rows)
+    seen = []
+
+    def chat(messages):
+        seen.append(messages)
+        return " the app ", {"prompt_tokens": 1000, "completion_tokens": 100}
+
+    out = tmp_path / "opus.json"
+    result = be.answer([str(src)], out, prompt="abilities", model="anthropic/claude-opus-5.5",
+                       provider="openrouter", chat=chat, workers=1)
+    assert result["config"]["answer_prompt"] == "abilities" and result["failed"] == 1
+    assert result["dollars"] == pytest.approx((1000 * 4 + 100 * 20) / 1e6)
+    good, bad = sorted(result["rows"], key=lambda r: r["qid"])
+    assert good["prediction"] == "the app" and good["rubric"] == ["has budget"]
+    assert "keep-context" in bad["answer_error"]
+    assert seen[0][0]["content"] == be.ABILITIES_SYSTEM
+    rows_back, config = be.read_rows([str(out)])
+    assert config["answer_model"] == "anthropic/claude-opus-5.5"
+    assert [v for r in rows_back for v, _ in be.answers_of(r)] == ["answer"]
+    # a second pass keeps the good answer and asks only for the failed one
+    seen.clear()
+    be.answer([str(src)], out, prompt="abilities", model="anthropic/claude-opus-5.5",
+              chat=chat, workers=1)
+    assert seen == []
+
+
+def test_answer_stops_at_its_cap(tmp_path):
+    rows = [kept_row(f"beam-7/summarization/{i}") for i in range(5)]
+    src = results_file(tmp_path / "r.json", rows)
+
+    def chat(messages):
+        return "x", {"prompt_tokens": 1000, "completion_tokens": 0}
+
+    result = be.answer([str(src)], tmp_path / "o.json", prompt="beam", model="gpt-4o-mini",
+                       chat=chat, workers=1, max_dollars=0.0004)
+    assert result["stopped"] and not result["complete"] and len(result["rows"]) == 2

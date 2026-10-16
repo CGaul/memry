@@ -227,11 +227,16 @@ def test_grade_writes_scores_and_resumes(tmp_path):
            "beam_ability": "summarization", "rubric": ["has budget", "has login"],
            "prediction": "budget and login",
            "answers_compared": {"20": {"prediction": "budget only"}}}
-    results = results_file(tmp_path / "r.json", [row, {"qid": "x", "conversation": "c"}])
+    broken = {"conversation": "beam-7", "qid": "beam-7/summarization/1",
+              "beam_ability": "summarization", "rubric": ["has budget"],
+              "prediction": "", "answer_error": "400 Bad Request"}
+    results = results_file(tmp_path / "r.json",
+                           [row, broken, {"qid": "x", "conversation": "c"}])
     out = tmp_path / "scores.json"
     judge = FakeJudge()
     result = be.grade([str(results)], out, chat=judge)
     assert result["complete"] and result["judge_calls"] == 4
+    assert result["failed_answers"] == ["beam-7/summarization/1 answer"]
     assert result["answer_model"] == "gpt-4o-mini"
     scores = {g["variant"]: g["llm_judge_score"] for g in result["graded"]}
     assert scores == {"answer": 1.0, "compared@20": 0.5}
@@ -272,3 +277,45 @@ def test_fetch_pages_and_refuses_shortened_cells(tmp_path):
 
     with pytest.raises(RuntimeError):
         be.fetch("100K", tmp_path / "x.json", get=short)
+
+
+def test_openai_chat_drops_a_temperature_the_model_refuses():
+    import httpx
+
+    from evals.mem0_judge import OpenAIChat
+
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "temperature" in body:
+            return httpx.Response(400, json={"error": {
+                "message": "Unsupported value: 'temperature' does not support 0 with this "
+                           "model.", "param": "temperature", "code": "unsupported_value"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "blue"}}],
+                                         "usage": {"prompt_tokens": 5, "completion_tokens": 1}})
+
+    llm = OpenAIChat("gpt-6-luna", api_key="k")
+    llm._client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert llm.chat([{"role": "user", "content": "colour?"}]) == "blue"
+    assert llm.chat([{"role": "user", "content": "again?"}]) == "blue"
+    assert ["temperature" in b for b in bodies] == [True, False, False]
+    assert llm.temperature is None and llm.last_usage()["prompt_tokens"] == 5
+
+
+def test_openai_chat_keeps_temperature_zero_where_it_is_taken():
+    import httpx
+
+    from evals.mem0_judge import OpenAIChat
+
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    llm = OpenAIChat("gpt-4o-mini", api_key="k")
+    llm._client = httpx.Client(transport=httpx.MockTransport(handler))
+    llm.chat([{"role": "user", "content": "hi"}])
+    assert bodies[0]["temperature"] == 0.0

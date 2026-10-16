@@ -163,10 +163,12 @@ def _render(template: str, values: dict[str, str]) -> str:
 
 class OpenAIChat(LLM):
     """An OpenAI chat model called as Mem0's evaluation calls one: the
-    messages as given, at temperature 0 (``OPENAI_API_KEY``). A timeout, a
-    dropped connection, a rate limit or a server error is tried again, up to
-    ``attempts`` calls in all. ``last_usage()`` is the ``usage`` of the reply
-    to this thread's last call."""
+    messages as given, at temperature 0 (``OPENAI_API_KEY``). A model that
+    takes only its default temperature (gpt-6-luna answers 400 to 0) is
+    asked again without one, and from then on is called at its default
+    (``temperature`` is None). A timeout, a dropped connection, a rate limit
+    or a server error is tried again, up to ``attempts`` calls in all.
+    ``last_usage()`` is the ``usage`` of the reply to this thread's last call."""
 
     name = "openai"
 
@@ -176,7 +178,7 @@ class OpenAIChat(LLM):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.available = bool(self.api_key)
         self.base_url = (base_url or OPENAI_URL).rstrip("/")
-        self.temperature = temperature
+        self.temperature: float | None = temperature
         self.attempts = max(attempts, 1)
         self._client = httpx.Client(timeout=timeout)
         self._local = threading.local()
@@ -188,8 +190,9 @@ class OpenAIChat(LLM):
         return getattr(self._local, "usage", None)
 
     def chat(self, messages: list[dict[str, str]], *, json_object: bool = False) -> str:
-        body: dict[str, Any] = {"model": self.model, "messages": messages,
-                                "temperature": self.temperature}
+        body: dict[str, Any] = {"model": self.model, "messages": messages}
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         if json_object:
             body["response_format"] = {"type": "json_object"}
         self._local.usage = None
@@ -207,6 +210,11 @@ class OpenAIChat(LLM):
             if resp.status_code in RETRY_STATUSES and not last:
                 time.sleep(2 ** attempt)
                 continue
+            if resp.status_code == 400 and "temperature" in body \
+                    and _rejects_temperature(resp) and not last:
+                self.temperature = None
+                body.pop("temperature")
+                continue
             resp.raise_for_status()
             payload = resp.json()
             self._local.usage = payload.get("usage")
@@ -216,6 +224,15 @@ class OpenAIChat(LLM):
     def complete(self, system: str, user: str, *, json_schema: dict[str, Any] | None = None) -> str:
         return self.chat([{"role": "system", "content": system},
                           {"role": "user", "content": user}])
+
+
+def _rejects_temperature(resp: httpx.Response) -> bool:
+    """Whether a 400 reply says the model does not take the temperature sent."""
+    try:
+        error = resp.json().get("error") or {}
+    except ValueError:
+        return False
+    return error.get("param") == "temperature"
 
 
 def locomo_time(stamp: Any) -> str:

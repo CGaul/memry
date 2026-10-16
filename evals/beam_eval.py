@@ -390,13 +390,15 @@ def official(grade: dict[str, Any], ability: str) -> float:
     return grade["tau_norm"] if ability == "event_ordering" else grade["llm_judge_score"]
 
 
-def answers_of(row: dict[str, Any]) -> Iterable[tuple[str, str]]:
-    """(variant, prediction) of each answer a results row carries."""
-    if row.get("prediction") is not None:
-        yield "answer", str(row["prediction"])
-    for at, answer in sorted((row.get("answers_compared") or {}).items()):
-        if answer.get("prediction") is not None:
-            yield f"compared@{at}", str(answer["prediction"])
+def answers_of(row: dict[str, Any], *, failed: bool = False) -> Iterable[tuple[str, str]]:
+    """(variant, prediction) of each answer a results row carries; with
+    ``failed``, the answers whose call failed (``answer_error``) instead,
+    which are never graded: an empty answer there is no answer at all."""
+    answers = [("answer", row)] + [(f"compared@{at}", a) for at, a in
+                                   sorted((row.get("answers_compared") or {}).items())]
+    for variant, answer in answers:
+        if answer.get("prediction") is not None and bool(answer.get("answer_error")) == failed:
+            yield variant, str(answer["prediction"])
 
 
 def read_rows(paths: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -476,7 +478,10 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
     with ThreadPoolExecutor(max(1, workers)) as pool:
         list(pool.map(one, todo))
     graded = sorted(done.values(), key=lambda g: (g["qid"], g["variant"]))
+    failed = sorted(f"{row['qid']} {variant}" for row in rows
+                    for variant, _ in answers_of(row, failed=True))
     result = {"judge_model": judge_model, "answer_model": config.get("answer_model"),
+              "failed_answers": failed,
               "compare_answer_model": config.get("compare_answer_model"),
               "complete": not stopped and len(graded) == sum(1 for r in rows
                                                               for _ in answers_of(r)),
@@ -490,7 +495,8 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
 
 
 def markdown(result: dict[str, Any]) -> str:
-    lines = [f"judge {result['judge_model']}, ${result['judge_dollars']} this pass"]
+    lines = [f"judge {result['judge_model']}, ${result['judge_dollars']} this pass, "
+             f"{len(result.get('failed_answers') or [])} failed answers not graded"]
     for variant, t in result["tables"].items():
         lines += ["", f"### {variant} ({t['n']} answers, {t['chats']} chats)", "",
                   "| ability | BEAM's score | by rubric |", "|---|---|---|"]

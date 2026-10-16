@@ -1213,6 +1213,12 @@ def memory_record(result: Any, ingested: Ingested) -> dict[str, Any]:
             "turns": sorted(ingested.turns_of(memory))}
 
 
+#: --keep-context: every answer keeps the lines it was shown ("context_lines"),
+#: so it can be answered again later, by another prompt or model, from exactly
+#: what Memry gave (``evals.beam_eval answer``) without loading the store again.
+KEEP_CONTEXT = False
+
+
 def answer_with(answer_llm: LLM, question: Question, memories: list[Memory],
                 answer_prompt: AnswerPrompt | None, evidence: list[Any] = (),
                 entities: list[Any] = ()) -> dict[str, Any]:
@@ -1221,9 +1227,11 @@ def answer_with(answer_llm: LLM, question: Question, memories: list[Memory],
     their ``evidence`` turns, as its context builder renders them
     (``context_lines``). That list is the memory list of the answer prompt
     (``answer_from``); ``k`` counts the memories."""
-    record = answer_from(answer_llm, question, context_lines(entities, memories, evidence),
-                         answer_prompt)
+    lines = context_lines(entities, memories, evidence)
+    record = answer_from(answer_llm, question, lines, answer_prompt)
     record["k"] = len(memories)
+    if KEEP_CONTEXT:
+        record["context_lines"] = [line if isinstance(line, str) else str(line) for line in lines]
     return record
 
 
@@ -2041,6 +2049,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="answer each question again from the same memory list with "
                              "this OpenAI chat model, kept under the row's answers_compared; "
                              "no further search")
+    parser.add_argument("--keep-context", action="store_true",
+                        help="keep the lines each answer was shown in its row "
+                             "(context_lines), to answer again from them later")
     parser.add_argument("--no-descriptions", action="store_true",
                         help="leave out the descriptions of the entities a question names "
                              "from the memory list (an ablation; default: shown, as an "
@@ -2253,6 +2264,8 @@ def run_workers(argv: list[str], conversation_ids: list[str], results_dir: pathl
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    global KEEP_CONTEXT
+    KEEP_CONTEXT = args.keep_context
     data_dir = os.environ.get(DATA_ENV, "").strip() or None
     path = find_dataset(args.dataset, data_dir, variant=args.variant, file=args.file)
     if path is None:

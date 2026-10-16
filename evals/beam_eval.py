@@ -317,6 +317,7 @@ class Budget:
     ``charge`` raises once the total passes ``cap``."""
 
     def __init__(self, model: str, cap: float | None) -> None:
+        self.model = model
         self.price = PRICES.get(model)
         self.cap = cap
         self.dollars = 0.0
@@ -334,7 +335,7 @@ class Budget:
             if self.price:
                 self.dollars += (tin * self.price[0] + tout * self.price[1]) / 1e6
             if self.cap is not None and self.dollars > self.cap:
-                raise CapReached(f"${self.dollars:.2f} of judge calls passes the cap of "
+                raise CapReached(f"${self.dollars:.2f} of {self.model} calls passes the cap of "
                                  f"${self.cap:.2f}")
 
 

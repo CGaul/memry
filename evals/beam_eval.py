@@ -577,8 +577,16 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
 
 
 def context_lines_of(row: dict[str, Any]) -> list[str] | None:
-    """The lines the row's headline answer was shown (``--keep-context``)."""
-    answer = (row.get("answers") or {}).get(str(row.get("answer_k")))
+    """The lines the row's headline answer was shown (``--keep-context``).
+    The harness files that answer under the k it asked for, and with
+    ``--all-members`` the answer read more memories than that: its ``k`` is
+    the row's ``answer_k``. So the answer is found by that count first, then
+    under the key."""
+    answers = row.get("answers") or {}
+    answer = next((a for a in answers.values()
+                   if isinstance(a, dict) and a.get("k") == row.get("answer_k")), None)
+    if answer is None:
+        answer = answers.get(str(row.get("answer_k")))
     lines = (answer or {}).get("context_lines")
     return list(lines) if isinstance(lines, list) else None
 

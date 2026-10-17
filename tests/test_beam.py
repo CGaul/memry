@@ -344,6 +344,17 @@ def test_prompts_build_each_answering_call():
                                "Question: What did I start?\nShort answer:")
 
 
+def test_the_context_of_an_answer_that_read_every_member_is_found():
+    # --all-members: the headline answer is filed under the k asked for (20) and read 58
+    row = kept_row(lines=("a line",))
+    row["answer_k"] = 58
+    row["answers"] = {"5": {"k": 5, "context_lines": ["five"]},
+                      "20": {"k": 58, "context_lines": ["a line", "another"]}}
+    assert be.context_lines_of(row) == ["a line", "another"]
+    assert be.context_lines_of(kept_row()) == ["15 March 2024: started the app"]
+    assert be.context_lines_of(kept_row(lines=None)) is None
+
+
 def test_answer_writes_a_results_file_grade_reads(tmp_path):
     rows = [kept_row(), kept_row("beam-7/summarization/1", lines=None)]
     src = results_file(tmp_path / "r.json", rows)

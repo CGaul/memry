@@ -102,7 +102,14 @@ on the questions it leaves alone. --full-context answers from the whole
 conversation, with no store and no search (Mem0's full-context baseline with
 evals.mem0_judge:full_context_messages). --decider jev makes Jev the store's
 decision provider at the save and at the question (TYPESAFE_API_KEY);
---store-dir keeps each store in a file. --workers N makes a question's answer
+--store-dir keeps each store in a file, with a trace of which turns each
+memory came from (<conversation>.trace.json); with --results-dir and no
+--store-dir, the stores are kept in <results dir>/stores. --reuse-stores
+asks the questions again on stores kept that way, without loading: a
+conversation whose store and trace are there is opened as it is, and one
+without them is loaded and kept. --all-members answers a question that
+needs several memories from every member the search found, past the top k,
+as an agent's search returns them. --workers N makes a question's answer
 and judge calls N at a time. --export-mem0 writes the headline answers as
 Mem0's per-question results file.
 
@@ -745,6 +752,44 @@ class Ingested:
         return turns if level == "turn" else {self.session_of_turn[t] for t in turns}
 
 
+def write_trace(path: pathlib.Path, ingested: Ingested, embedder: Embedder) -> None:
+    """The trace of a load, kept beside its store: which turns each memory
+    came from, so the questions can be asked again on the store without
+    loading it again (``read_trace``), and the embedder's model, so a run
+    with another embedder is refused."""
+    _write_json(path, {
+        "conversation": ingested.conversation.conv_id,
+        "embedder": embedder.model_id,
+        "turn_of_episode": ingested.turn_of_episode,
+        "turns_of_memory": {mid: sorted(turns) for mid, turns in ingested.turns_of_memory.items()},
+        "actions": dict(ingested.actions),
+        "warnings": ingested.warnings,
+        "seconds": ingested.seconds,
+    })
+
+
+def read_trace(path: pathlib.Path, store: MemoryStore, conversation: Conversation,
+               embedder: Embedder) -> Ingested:
+    """The load a trace records (``write_trace``), on the store kept with it."""
+    data = _read_json_file(path) or {}
+    if data.get("conversation") != conversation.conv_id:
+        raise SystemExit(f"{path}: a trace of {data.get('conversation')!r}; this "
+                         f"conversation is {conversation.conv_id!r}")
+    if data.get("embedder") != embedder.model_id:
+        raise SystemExit(f"{path}: the store was loaded with the embedder "
+                         f"{data.get('embedder')!r}; this run has {embedder.model_id!r}")
+    return Ingested(
+        store, conversation,
+        session_of_turn={t.key: s.session_id for s in conversation.sessions for t in s.turns},
+        turn_of_episode=dict(data.get("turn_of_episode") or {}),
+        turns_of_memory={mid: set(turns)
+                         for mid, turns in (data.get("turns_of_memory") or {}).items()},
+        seconds=float(data.get("seconds") or 0.0),
+        warnings=list(data.get("warnings") or []),
+        actions=Counter(data.get("actions") or {}),
+    )
+
+
 def transient(exc: BaseException) -> bool:
     """A provider error worth another try: a timeout, a dropped connection,
     or a reply in ``RETRY_STATUSES``."""
@@ -1323,7 +1368,7 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         correction: dict[str, Any] | None = None,
         compare_evidence_tokens: int | None = None,
         compare_answer_llm: LLM | None = None,
-        descriptions: bool = True) -> dict[str, Any]:
+        descriptions: bool = True, all_members: bool = False) -> dict[str, Any]:
     """Search for one question once, score what came back, and answer when
     asked: from the top k of that search for each k of ``ks`` (default
     ``[k]``), after the descriptions of the entities the question names
@@ -1339,7 +1384,10 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
     kept under "answers_compared" and counted under "answer:compared" and
     "judge:compared"; ``compare_answer_llm`` writes that second answer (the
     turns within the store's own budget unless ``compare_evidence_tokens``
-    is given too)."""
+    is given too). With ``all_members``, a question that needs several
+    memories is answered at ``k`` from every member the search found, past
+    the depth, as an agent's search returns them; the recall figures and
+    the row's ``memories`` keep to the depth either way."""
     ks = sorted(set(ks or [k]) | {k})
     depth = max(DEPTH, *ks)
     store = ingested.store
@@ -1348,6 +1396,8 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         results = store.search(question.question, user_id=BENCH_USER, limit=depth,
                                evidence=False)
     ms = (time.perf_counter() - started) * 1000
+    # a question needing several memories returns every member found, past the depth
+    found = results if all_members and len(results) > depth else results[:depth]
     results = results[:depth]
     units = [ingested.units_of(r.memory, question.level) for r in results]
     row: dict[str, Any] = {
@@ -1366,7 +1416,7 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
     for at in KS:
         row[f"recall@{at}"] = evidence_recall(units, question.evidence, at)
     row["mrr"] = reciprocal_rank(units, question.evidence)
-    row.update(search_signals(store, question.question, results))
+    row.update(search_signals(store, question.question, found))
     if answer_llm is None:
         return row
     if correction is not None:
@@ -1392,7 +1442,10 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
             record["answer_seconds"] = round(time.perf_counter() - started, 3)
             answers[k] = record
     else:
-        top = [r.memory for r in results]
+        top = [r.memory for r in found]
+        # how many memories each k's answer reads: at k, every member found when they
+        # run past the depth (all_members), else k
+        widths = {at: len(found) if at == k and len(found) > depth else at for at in ks}
         # the entities the question names, described as an agent's context describes them
         described: list[Any] = []
         if descriptions:
@@ -1408,19 +1461,19 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         # the source turns of each k's memories, as a search of that depth chooses them,
         # chosen once for each budget
         with api_usage.stage(search_stage):
-            chosen = {(budget, at): store.evidence(question.question, results[:at],
+            chosen = {(budget, at): store.evidence(question.question, found[:widths[at]],
                                                    user_id=BENCH_USER, token_budget=budget)
                       for budget in dict.fromkeys(budgets.values()) for at in ks}
         turns = {(name, at): chosen[(budget, at)] for name, budget in budgets.items()
                  for at in ks}
         if pool is not None and len(turns) > 1:
             futures = {key: pool.submit(contextvars.copy_context().run, staged, key[0],
-                                        answer_with, writers[key[0]], question, top[:key[1]],
+                                        answer_with, writers[key[0]], question, top[:widths[key[1]]],
                                         answer_prompt, shown, described)
                        for key, shown in turns.items()}
             done = {key: future.result() for key, future in futures.items()}
         else:
-            done = {key: staged(key[0], answer_with, writers[key[0]], question, top[:key[1]],
+            done = {key: staged(key[0], answer_with, writers[key[0]], question, top[:widths[key[1]]],
                                 answer_prompt, shown, described)
                     for key, shown in turns.items()}
         for key, record in done.items():
@@ -1674,6 +1727,23 @@ def store_stats(store: MemoryStore, conversation: Conversation) -> dict[str, Any
             "speaker_entities": speakers}
 
 
+def code_version() -> dict[str, Any] | None:
+    """The commit and branch of the code this runs from, and whether its
+    tracked files have uncommitted changes, so a results file says what
+    ran; None where git cannot say."""
+    def git(*args: str) -> str | None:
+        try:
+            return subprocess.run(["git", *args], cwd=str(HERE.parent), capture_output=True,
+                                  text=True, timeout=10, check=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        return None
+    return {"commit": commit, "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=no"))}
+
+
 def _qualname(function: Any) -> str | None:
     if function is None:
         return None
@@ -1755,7 +1825,8 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
                   evidence_tokens: int | None = None,
                   compare_evidence_tokens: int | None = None,
                   compare_answer_llm: LLM | None = None,
-                  descriptions: bool = True) -> dict[str, Any]:
+                  descriptions: bool = True, reuse_stores: bool = False,
+                  all_members: bool = False) -> dict[str, Any]:
     """Ingest each conversation into a fresh store and ask its questions once
     per pass of ``search_deciders`` (name -> the decision provider the store
     asks with, given it once the conversation is loaded; default: the store's
@@ -1774,8 +1845,12 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
     with the turns chosen within that many tokens, and ``compare_answer_llm``
     with that model (``ask``); ``descriptions``
     false leaves out the descriptions of the entities a question names, for
-    an ablation. Returns {config, stores, passes, tables (the first
-    pass's), rows, warnings, notes, complete}. A call refused at a cap
+    an ablation. ``reuse_stores`` opens a conversation's store and trace
+    that an earlier load kept in ``store_dir`` instead of loading
+    (``read_trace``); one not kept is loaded and kept. ``all_members``
+    answers a question needing several memories from every member the
+    search found (``ask``). Returns {config, stores, passes, tables (the
+    first pass's), rows, warnings, notes, complete}. A call refused at a cap
     (``api_usage.CapReached``) ends the run where it is: what was done is
     kept, "complete" is false and "stopped" says where."""
     embedder = embedder or HashEmbedder(256)
@@ -1820,11 +1895,19 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
             continue
         if mode == "verbatim" and hasattr(embedder, "warm"):
             embedder.warm([t.text for t in conv.turns] + [q.question for q in asked])
+        kept = pathlib.Path(store_dir) / f"{conv.conv_id}.sqlite" if store_dir else None
+        trace = kept.parent / f"{conv.conv_id}.trace.json" if kept else None
+        reused = bool(reuse_stores and not store_factory and kept and kept.exists()
+                      and trace.exists())
+        if reuse_stores and not store_factory and kept and kept.exists() and not reused:
+            # a store kept by a load before traces existed is not replaced by accident
+            raise SystemExit(f"{kept}: a store with no trace beside it; --reuse-stores "
+                             f"cannot open it and does not replace it. Load into another "
+                             f"--store-dir, or keep a trace with the load.")
         if store_factory:
             store = store_factory()
         else:
-            db_path = fresh_db(pathlib.Path(store_dir) / f"{conv.conv_id}.sqlite") \
-                if store_dir else ":memory:"
+            db_path = str(kept) if reused else fresh_db(kept) if kept else ":memory:"
             store = make_store(mode, embedder, decider=decider, db_path=db_path)
         if evidence_tokens is not None:
             store.config.retrieval.evidence_tokens = evidence_tokens
@@ -1835,9 +1918,17 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
                 if mode == "extract" and not store.llm.available:
                     raise SystemExit("--ingest extract needs a configured LLM "
                                      "(OPENAI_API_KEY, ANTHROPIC_API_KEY or MEMRY_LLM_PROVIDER)")
-                with api_usage.stage("ingest"):
-                    ingested = ingest(store, conv, mode=mode, unit=unit, when=when,
-                                      dataset=dataset)
+                if reused:
+                    ingested = read_trace(trace, store, conv, embedder)
+                    entry["reused"] = True
+                else:
+                    if trace is not None and trace.exists():
+                        trace.unlink()  # a trace stands for a whole load only
+                    with api_usage.stage("ingest"):
+                        ingested = ingest(store, conv, mode=mode, unit=unit, when=when,
+                                          dataset=dataset)
+                    if trace is not None:
+                        write_trace(trace, ingested, embedder)
                 entry.update(memories=len(store.get_all(user_id=BENCH_USER, limit=1_000_000)),
                              ingest_seconds=round(ingested.seconds, 2),
                              actions=dict(ingested.actions), **store_stats(store, conv))
@@ -1856,7 +1947,7 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
                                 pool=pool, correction=corrections.get(question.qid),
                                 compare_evidence_tokens=compare_evidence_tokens,
                                 compare_answer_llm=compare_answer_llm,
-                                descriptions=descriptions)})
+                                descriptions=descriptions, all_members=all_members)})
                     finally:
                         entry[f"seconds_{name}"] = round(time.perf_counter() - started, 2)
                         if decider is not None:
@@ -1892,6 +1983,7 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
                    "categories": sorted(categories) if categories else None,
                    "decider": decider, "full_context": full_context,
                    "audited_questions": len(corrections),
+                   "reuse_stores": reuse_stores, "all_members": all_members,
                    "conversations": len(conversations), "questions_per_conversation": questions,
                    "answer_llm": getattr(answer_llm, "name", None) if answer_llm else None,
                    "answer_model": getattr(answer_llm, "model", None) if answer_llm else None,
@@ -2006,7 +2098,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "the configured one (default), none, or Jev (TYPESAFE_API_KEY)")
     parser.add_argument("--store-dir", default=None,
                         help="keep each conversation's store in <dir>/<conversation>.sqlite "
-                             "(default: in memory)")
+                             "with its trace (default: in memory, or <results dir>/stores "
+                             "with --results-dir)")
     parser.add_argument("--full-context", action="store_true",
                         help="answer from the whole conversation: no store, no search")
     parser.add_argument("--audit", default=None, metavar="ERRORS_JSON",
@@ -2052,6 +2145,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-context", action="store_true",
                         help="keep the lines each answer was shown in its row "
                              "(context_lines), to answer again from them later")
+    parser.add_argument("--reuse-stores", action="store_true",
+                        help="ask the questions again on the stores and traces kept in "
+                             "--store-dir, without loading; a conversation without them is "
+                             "loaded and kept")
+    parser.add_argument("--all-members", action="store_true",
+                        help="answer a question that needs several memories from every "
+                             "member the search found, past the top k, as an agent's "
+                             "search returns them")
     parser.add_argument("--no-descriptions", action="store_true",
                         help="leave out the descriptions of the entities a question names "
                              "from the memory list (an ablation; default: shown, as an "
@@ -2217,7 +2318,7 @@ def _write_json(path: pathlib.Path, data: Any) -> None:
 #: file written under other values of these is still reused.
 _RUN_ONLY = ("jobs", "results_dir", "out", "worker", "usage_db", "max_calls", "caps",
              "conversation", "limit", "seed", "workers", "store_dir", "export_mem0",
-             "k_list", "category_set")
+             "k_list", "category_set", "reuse_stores")
 
 
 def run_options(args: argparse.Namespace) -> dict[str, Any]:
@@ -2300,6 +2401,8 @@ def main(argv: list[str] | None = None) -> int:
         print(text, file=sys.stderr, flush=True)
 
     results_dir = pathlib.Path(args.results_dir) if args.results_dir else None
+    if results_dir is not None and args.store_dir is None and not args.full_context:
+        args.store_dir = str(results_dir / "stores")  # a load is kept unless said otherwise
     notes: list[str] = []
     if results_dir is not None:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -2351,6 +2454,7 @@ def main(argv: list[str] | None = None) -> int:
                         categories=set(args.category_set) if args.category_set else None,
                         workers=args.workers, corrections=corrections, decider=args.decider,
                         store_dir=args.store_dir, full_context=args.full_context,
+                        reuse_stores=args.reuse_stores, all_members=args.all_members,
                         evidence_tokens=args.evidence_tokens,
                         compare_evidence_tokens=args.compare_evidence_tokens,
                         compare_answer_llm=compare_answer_llm,
@@ -2359,7 +2463,8 @@ def main(argv: list[str] | None = None) -> int:
         def finish(part: dict[str, Any]) -> dict[str, Any]:
             part["file"] = str(path)
             part["config"].update(limit=args.limit, seed=args.seed, options=options,
-                                  variant=args.variant if args.dataset != "locomo" else None)
+                                  variant=args.variant if args.dataset != "locomo" else None,
+                                  code=code_version())
             part["notes"] = notes + part["notes"]
             return part
 

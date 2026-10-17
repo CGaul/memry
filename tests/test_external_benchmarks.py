@@ -1573,3 +1573,78 @@ def test_ledgers_opened_at_the_same_moment_all_open(tmp_path):
             assert meter._db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
             meter.close()
     assert failures == []
+
+
+# --------------------------------------------------------------------------
+# kept stores, asked again, and every member of a set
+
+
+def test_a_results_dir_keeps_the_stores_and_reuse_asks_again_without_loading(
+        monkeypatch, tmp_path, no_models):
+    monkeypatch.setenv(xb.DATA_ENV, str(FIXTURES))
+    base = ["--dataset", "locomo", "--file", "locomo_mini.json"]
+    out = tmp_path / "all.json"
+    assert xb.main([*base, "--results-dir", str(tmp_path / "parts"), "--out", str(out)]) == 0
+    first = json.loads(out.read_text())
+    stores = tmp_path / "parts" / "stores"
+    kept = {p.name for p in stores.iterdir() if not p.name.endswith(("-wal", "-shm"))}
+    assert kept == {"conv-mini-1.sqlite", "conv-mini-1.trace.json",
+                    "conv-mini-2.sqlite", "conv-mini-2.trace.json"}
+    trace = json.loads((stores / "conv-mini-1.trace.json").read_text())
+    assert trace["conversation"] == "conv-mini-1"
+    assert trace["embedder"] == first["config"]["embedder"]
+    assert trace["turns_of_memory"] and trace["turn_of_episode"]
+    assert all("reused" not in s for s in first["stores"])
+    code = first["config"]["code"]
+    assert code is None or (len(code["commit"]) == 40 and isinstance(code["dirty"], bool))
+    # asked again on the kept stores: the same memories traced to the same turns, no load
+    again_out = tmp_path / "again.json"
+    assert xb.main([*base, "--results-dir", str(tmp_path / "parts2"), "--out", str(again_out),
+                    "--store-dir", str(stores), "--reuse-stores"]) == 0
+    again = json.loads(again_out.read_text())
+    assert [s["reused"] for s in again["stores"]] == [True, True]
+    assert again["config"]["reuse_stores"] is True
+    assert [r["retrieved"] for r in again["rows"]] == [r["retrieved"] for r in first["rows"]]
+    assert [r["recall@5"] for r in again["rows"]] == [r["recall@5"] for r in first["rows"]]
+    assert [s["memories"] for s in again["stores"]] == [s["memories"] for s in first["stores"]]
+    # a store without a trace beside it is neither opened nor replaced
+    (stores / "conv-mini-2.trace.json").unlink()
+    with pytest.raises(SystemExit, match="no trace"):
+        xb.main([*base, "--results-dir", str(tmp_path / "parts4"),
+                 "--out", str(tmp_path / "y.json"), "--store-dir", str(stores),
+                 "--reuse-stores", "--conversation", "conv-mini-2"])
+    assert (stores / "conv-mini-2.sqlite").exists()
+    # a store loaded with another embedder is refused
+    other = dict(trace, embedder="other-model")
+    (stores / "conv-mini-1.trace.json").write_text(json.dumps(other))
+    with pytest.raises(SystemExit, match="embedder"):
+        xb.main([*base, "--results-dir", str(tmp_path / "parts3"),
+                 "--out", str(tmp_path / "x.json"), "--store-dir", str(stores),
+                 "--reuse-stores", "--conversation", "conv-mini-1"])
+
+
+def test_all_members_answers_from_every_member_the_search_found(monkeypatch):
+    conv = xb.load_locomo(LOCOMO)[0]
+    original = xb.MemoryStore.search
+
+    def every_result_is_a_member(self, query, **kwargs):
+        results = original(self, query, **{**kwargs, "limit": 100})
+        for result in results:
+            result.signals = {**(result.signals or {}), "member": True}
+        return results
+
+    monkeypatch.setattr(xb.MemoryStore, "search", every_result_is_a_member)
+    monkeypatch.setattr(xb, "DEPTH", 3)
+    llm = ScriptedLLM(dict.fromkeys((q.question for q in conv.questions), "x"))
+
+    def run(**options):
+        return xb.run_benchmark([conv], dataset="locomo", answer_llm=llm, k=3, questions=1,
+                                embedder=HashEmbedder(128), log=lambda _: None, **options)
+
+    top = run()["rows"][0]
+    assert top["answer_k"] == 3 and top["set_members"] == 3 and len(top["memories"]) == 3
+    every = run(all_members=True)["rows"][0]
+    members = every["set_members"]
+    assert members > 3 and every["answer_k"] == members
+    assert len(every["memories"]) == 3 and every["recall@5"] == top["recall@5"]
+    assert llm.prompts[-1].count(" (said ") == members

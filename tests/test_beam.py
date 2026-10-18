@@ -296,7 +296,8 @@ def test_openai_chat_drops_a_temperature_the_model_refuses():
         return httpx.Response(200, json={"choices": [{"message": {"content": "blue"}}],
                                          "usage": {"prompt_tokens": 5, "completion_tokens": 1}})
 
-    llm = OpenAIChat("gpt-6-luna", api_key="k")
+    # a model that takes temperatures by its name, yet refuses this one
+    llm = OpenAIChat("gpt-4o-mini-later", api_key="k")
     llm._client = httpx.Client(transport=httpx.MockTransport(handler))
     assert llm.chat([{"role": "user", "content": "colour?"}]) == "blue"
     assert llm.chat([{"role": "user", "content": "again?"}]) == "blue"

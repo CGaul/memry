@@ -576,28 +576,45 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
     return result
 
 
-def context_lines_of(row: dict[str, Any]) -> list[str] | None:
-    """The lines the row's headline answer was shown (``--keep-context``).
-    The harness files that answer under the k it asked for, and with
-    ``--all-members`` the answer read more memories than that: its ``k`` is
-    the row's ``answer_k``. So the answer is found by that count first, then
-    under the key."""
+#: --context of ``answer``: which of the kept lines are answered from. "full":
+#: what the answer was shown, turn search's turns included; "bare": the same
+#: memories and evidence without turn search's turns (the lines shown when it
+#: added none); "evidence:N": the same memories with the evidence turns chosen
+#: within N tokens (the harness's --keep-evidence-tokens N), no turn search.
+CONTEXTS = ("full", "bare", "evidence:N")
+
+
+def context_lines_of(row: dict[str, Any], variant: str = "full") -> list[str] | None:
+    """The lines the row's headline answer was shown (``--keep-context``),
+    or another ``variant`` of them (``CONTEXTS``). The harness files that
+    answer under the k it asked for, and with ``--all-members`` the answer
+    read more memories than that: its ``k`` is the row's ``answer_k``. So the
+    answer is found by that count first, then under the key."""
     answers = row.get("answers") or {}
     answer = next((a for a in answers.values()
                    if isinstance(a, dict) and a.get("k") == row.get("answer_k")), None)
     if answer is None:
         answer = answers.get(str(row.get("answer_k")))
-    lines = (answer or {}).get("context_lines")
+    answer = answer or {}
+    if variant == "full":
+        lines = answer.get("context_lines")
+    elif variant == "bare":
+        lines = answer.get("context_lines_bare") or answer.get("context_lines")
+    elif variant.startswith("evidence:"):
+        lines = (answer.get("context_lines_evidence") or {}).get(variant.split(":", 1)[1])
+    else:
+        raise ValueError(f"context {variant!r}: full, bare or evidence:N")
     return list(lines) if isinstance(lines, list) else None
 
 
 def answer(paths: list[str], out: pathlib.Path, *, prompt: str, model: str,
            provider: str = "openai", max_dollars: float | None = None, workers: int = 8,
-           chat: Chat | None = None) -> dict[str, Any]:
+           chat: Chat | None = None, context: str = "full") -> dict[str, Any]:
     """Answer every question of the results files again, from the lines its
     first answer was shown, with ``prompt`` and ``model``; written as a
     results file ``grade`` reads. Answers already in ``out`` without an
-    error are kept, so an interrupted pass resumes."""
+    error are kept, so an interrupted pass resumes. ``context`` picks the
+    variant of the kept lines (``CONTEXTS``)."""
     rows, config = read_rows(paths)
     build = PROMPTS[prompt]
     chat = chat or openai_chat(model, provider)
@@ -617,7 +634,7 @@ def answer(paths: list[str], out: pathlib.Path, *, prompt: str, model: str,
         if stopped or row["qid"] in done:
             return
         record = {key: row.get(key) for key in keep}
-        lines = context_lines_of(row)
+        lines = context_lines_of(row, context)
         started = time.perf_counter()
         if lines is None:
             record.update(prediction="", answer_error="no context_lines in the row "
@@ -641,7 +658,7 @@ def answer(paths: list[str], out: pathlib.Path, *, prompt: str, model: str,
         list(pool.map(one, rows))
     answered = sorted(done.values(), key=lambda r: r["qid"])
     result = {"config": {"answer_model": model, "answer_prompt": prompt, "provider": provider,
-                         "from": [str(p) for p in paths],
+                         "context": context, "from": [str(p) for p in paths],
                          "loaded_with": {k: config.get(k) for k in ("ingest", "decider", "k",
                                                                     "embedder", "variant")}},
               "complete": not stopped and len(answered) == len(rows),
@@ -688,6 +705,10 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--max-dollars", type=float, default=None,
                    help="stop once the answers have cost more than this many dollars")
     a.add_argument("--workers", type=int, default=8)
+    a.add_argument("--context", default="full", metavar="full|bare|evidence:N",
+                   help="which kept lines to answer from: what was shown (full), the same "
+                        "without turn search's turns (bare), or the evidence within N tokens "
+                        "(evidence:N, kept with the harness's --keep-evidence-tokens N)")
     g = sub.add_parser("grade", help="grade a results file with BEAM's rubric judge")
     g.add_argument("results", nargs="+", help="results files or a --results-dir")
     g.add_argument("--out", required=True)
@@ -706,7 +727,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "answer":
         result = answer(args.results, pathlib.Path(args.out), prompt=args.prompt,
                         model=args.model, provider=args.provider,
-                        max_dollars=args.max_dollars, workers=args.workers)
+                        max_dollars=args.max_dollars, workers=args.workers,
+                        context=args.context)
         print(json.dumps({k: result[k] for k in ("complete", "stopped", "failed", "calls",
                                                  "tokens", "dollars", "seconds")}))
         return 3 if result["stopped"] else 0

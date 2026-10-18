@@ -791,6 +791,12 @@ def _cut(vector: list[float], keep: int | None) -> list[float]:
     return (short / (float(np.linalg.norm(short)) or 1.0)).tolist()
 
 
+def _turn_key(turn: EvidenceTurn) -> str:
+    """A turn's identity: its passage, or its episode for a turn of a whole
+    episode."""
+    return turn.passage_id or turn.episode_id
+
+
 def _similarity(asked: np.ndarray, vector: np.ndarray | None) -> float:
     """Cosine of a memory's vector and the question's (already of length one),
     the vector cut to the question's length; 0 for a missing or shorter one
@@ -2846,6 +2852,18 @@ class MemoryStore:
             return
         self.backend.set_episode_vectors(
             {e.id: v for e, v in zip(episodes, vectors) if v}, self.embedder.model_id)
+        # an episode's only passage took its vector; the parts of a longer one
+        # are embedded on their own, in one call
+        parts = [p for found in self.backend.passages_of([e.id for e in episodes]).values()
+                 for p in found if p.count > 1]
+        if not parts:
+            return
+        try:
+            vectors = self.embedder.embed([p.content for p in parts])
+        except Exception:
+            return
+        self.backend.set_passage_vectors(
+            {p.id: v for p, v in zip(parts, vectors) if v}, self.embedder.model_id)
 
     def evidence(
         self,
@@ -2895,38 +2913,72 @@ class MemoryStore:
             e for e in self.backend.evidence_episodes(list(resting))
             if all(getattr(scope, f) is None or getattr(scope, f) == getattr(e, f)
                    for f in ("user_id", "agent_id", "run_id"))
-            and not any(" ".join(e.content.casefold().split()) in texts[mid]
-                        for mid in resting[e.id])
         ]
-        if not episodes:
+        turns = [
+            turn for turn in self._passage_turns(episodes, resting)
+            if not any(" ".join(turn.content.casefold().split()) in texts[mid]
+                       for mid in resting[turn.episode_id])
+        ]
+        if not turns:
             return []
         if query_vector is None:
             query_vector = self._query_vector(query)
         asked = np.asarray(query_vector, dtype=np.float32) if query_vector else None
-        vectors = (self.backend.episode_vectors_of([e.id for e in episodes],
-                                                   self.embedder.model_id)
-                   if asked is not None else {})
         if asked is not None:
             asked /= float(np.linalg.norm(asked)) or 1.0
-        words = self.backend.episode_keyword_scores(query, [e.id for e in episodes])
-        turns = [
-            EvidenceTurn(episode_id=e.id, content=e.content, speaker=e.speaker,
-                         said_at=e.created_at, memory_ids=resting[e.id],
-                         score=round(_similarity(asked, vectors.get(e.id))
-                                     if asked is not None else 0.0, 6))
-            for e in episodes
-        ]
-        order = {turn.episode_id: i for i, turn in enumerate(turns)}  # as said
+        vectors = self._turn_vectors(turns) if asked is not None else {}
+        words = self._turn_words(query, turns)
+        turns = [turn.model_copy(update={"score": round(
+                     _similarity(asked, vectors.get(_turn_key(turn)))
+                     if asked is not None else 0.0, 6)}) for turn in turns]
+        order = {_turn_key(turn): i for i, turn in enumerate(turns)}  # as said
         chosen: set[str] = set()
         used = 0
-        for turn in sorted(turns, key=lambda t: (-t.score, -words.get(t.episode_id, 0.0),
-                                                 order[t.episode_id])):
+        for turn in sorted(turns, key=lambda t: (-t.score, -words.get(_turn_key(t), 0.0),
+                                                 order[_turn_key(t)])):
             cost = estimate_tokens(turn_line(turn)) + 1
             if used + cost > budget:
                 continue
-            chosen.add(turn.episode_id)
+            chosen.add(_turn_key(turn))
             used += cost
-        return [turn for turn in turns if turn.episode_id in chosen]
+        return [turn for turn in turns if _turn_key(turn) in chosen]
+
+    def _passage_turns(
+        self, episodes: list[Episode], resting: dict[str, list[str]] | None = None
+    ) -> list[EvidenceTurn]:
+        """These episodes as turns, in their order: each episode's passages
+        (``models.Passage``) in order, or the whole episode where the backend
+        keeps none. ``resting`` gives each episode's memories."""
+        passages = self.backend.passages_of([e.id for e in episodes])
+        turns: list[EvidenceTurn] = []
+        for e in episodes:
+            common = {"episode_id": e.id, "speaker": e.speaker, "said_at": e.created_at,
+                      "memory_ids": list((resting or {}).get(e.id, []))}
+            parts = passages.get(e.id)
+            if not parts:
+                turns.append(EvidenceTurn(content=e.content, **common))
+                continue
+            turns.extend(EvidenceTurn(passage_id=p.id, part=p.position + 1, parts=p.count,
+                                      content=p.content, **common) for p in parts)
+        return turns
+
+    def _turn_vectors(self, turns: list[EvidenceTurn]) -> dict[str, np.ndarray]:
+        """Each turn's vector by ``_turn_key``: its passage's, or its episode's
+        for a turn of a whole episode."""
+        model = self.embedder.model_id
+        vectors = dict(self.backend.passage_vectors_of(
+            [t.passage_id for t in turns if t.passage_id], model))
+        vectors.update(self.backend.episode_vectors_of(
+            [t.episode_id for t in turns if not t.passage_id], model))
+        return vectors
+
+    def _turn_words(self, query: str, turns: list[EvidenceTurn]) -> dict[str, float]:
+        """Each turn's full-text score for ``query`` by ``_turn_key``."""
+        scores = dict(self.backend.passage_keyword_scores(
+            query, [t.passage_id for t in turns if t.passage_id]))
+        scores.update(self.backend.episode_keyword_scores(
+            query, [t.episode_id for t in turns if not t.passage_id]))
+        return scores
 
     def turn_search_due(self, results: list[SearchResult]) -> bool:
         """Whether turn search runs for these results (``turn_search``):
@@ -3024,42 +3076,72 @@ class MemoryStore:
         if query_vector is None:
             query_vector = self._query_vector(query)
         fused: dict[str, float] = defaultdict(float)
-        lists = [self.backend.episode_keyword_search(query, scope, TURN_CANDIDATES)]
+        lists = [self.backend.passage_keyword_search(query, scope, TURN_CANDIDATES)]
         if query_vector:
-            lists.append(self.backend.episode_vector_search(
+            lists.append(self.backend.passage_vector_search(
                 query_vector, self.embedder.model_id, scope, TURN_CANDIDATES))
         for found in lists:
-            for rank, (episode_id, _) in enumerate(found, start=1):
-                fused[episode_id] += 1.0 / (cfg.rrf_k + rank)
-        order = sorted(fused, key=lambda e: -fused[e])  # a tie: words first, as found
+            for rank, (passage_id, _) in enumerate(found, start=1):
+                fused[passage_id] += 1.0 / (cfg.rrf_k + rank)
+        order = sorted(fused, key=lambda p: -fused[p])  # a tie: words first, as found
         note["candidates"] = len(order)
         said = [" ".join(r.memory.content.casefold().split()) for r in results]
 
-        def says_whole(episode: Episode) -> bool:
-            words = " ".join(episode.content.casefold().split())
+        def says_whole(turn: EvidenceTurn) -> bool:
+            words = " ".join(turn.content.casefold().split())
             return any(words in text for text in said)
 
-        seen = {t.episode_id for t in shown}
-        allowed = {e.id: e for e in self.backend.turn_search_episodes(order)}
-        hits = [e for e in order
-                if e in allowed and e not in seen and not says_whole(allowed[e])][:TURN_HITS]
+        def episode_of(passage_id: str) -> str:
+            return passage_id.rpartition(":")[0]
+
+        seen = {_turn_key(t) for t in shown}
+        allowed = {e.id: e for e in self.backend.turn_search_episodes(
+            list(dict.fromkeys(episode_of(p) for p in order)))}
+        found = {_turn_key(turn): turn for turn in self._passage_turns(list(allowed.values()))}
+        hits = [p for p in order
+                if p in found and p not in seen and not says_whole(found[p])][:TURN_HITS]
         taken: set[str] = set()
         excerpts: list[dict[str, Any]] = []
         for hit in hits:
             if hit in taken:
                 continue
-            window = self.backend.episode_neighbours(hit, TURN_BEFORE, TURN_AFTER)
+            window = self.backend.episode_neighbours(episode_of(hit), TURN_BEFORE, TURN_AFTER)
             fine = {e.id for e in self.backend.turn_search_episodes([e.id for e in window])}
-            read = [e for e in window if e.id in fine and e.id not in taken
-                    and not says_whole(e)]
-            if not any(e.id == hit for e in read):
+            around = self._passage_turns(window)
+            place = next((i for i, turn in enumerate(around) if _turn_key(turn) == hit), None)
+            if place is None or episode_of(hit) not in fine:
                 continue
-            taken.update(e.id for e in read)
-            turns = [EvidenceTurn(episode_id=e.id, content=e.content, speaker=e.speaker,
-                                  said_at=e.created_at) for e in read]
-            new = [t for t in turns if t.episode_id not in seen]
+
+            def usable(i: int) -> bool:
+                if not 0 <= i < len(around):
+                    return False
+                turn = around[i]
+                return (turn.episode_id in fine and _turn_key(turn) not in taken
+                        and not says_whole(turn))
+
+            def cost(i: int) -> int:
+                turn = around[i]
+                return 0 if _turn_key(turn) in seen else estimate_tokens(turn_line(turn)) + 1
+
+            # the match, then the turns before it, then those after it, each
+            # while the excerpt fits the budget on its own
+            if cost(place) > budget:
+                continue
+            read, used = [place], cost(place)
+            for side in (range(place - 1, place - TURN_BEFORE - 1, -1),
+                         range(place + 1, place + TURN_AFTER + 1)):
+                for i in side:
+                    if not usable(i):
+                        continue
+                    if used + cost(i) > budget:
+                        break
+                    read.append(i)
+                    used += cost(i)
+            turns = [around[i] for i in sorted(read)]
+            taken.update(_turn_key(turn) for turn in turns)
+            new = [turn for turn in turns if _turn_key(turn) not in seen]
             excerpts.append({"hit": hit, "turns": turns,
-                             "tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in new),
+                             "tokens": sum(estimate_tokens(turn_line(turn)) + 1 for turn in new),
                              "new": new})
         if not excerpts:
             note["excerpts"], note["chosen"] = [], []
@@ -3077,14 +3159,18 @@ class MemoryStore:
         note["excerpts"] = [{"hit": item["hit"], "score": round(item["score"], 4),
                              "tokens": item["tokens"],
                              "episode_ids": [t.episode_id for t in item["turns"]],
-                             "new_ids": [t.episode_id for t in item["new"]]}
+                             "new_ids": [t.episode_id for t in item["new"]],
+                             "passage_ids": [_turn_key(t) for t in item["turns"]],
+                             "new_passage_ids": [_turn_key(t) for t in item["new"]]}
                             for item in excerpts]
         note["chosen"] = chosen
-        picked = {t.episode_id: t.model_copy(update={"score": round(excerpts[i]["score"], 6)})
+        picked = {_turn_key(t): t.model_copy(update={"score": round(excerpts[i]["score"], 6)})
                   for i in chosen for t in excerpts[i]["new"]}
-        # in the order said: time, then the order saved
-        return [picked[e.id] for e in self.backend.turn_search_episodes(list(picked))
-                if e.id in picked]
+        # in the order said: time, then the order saved, then the part
+        said_order = {e.id: n for n, e in enumerate(self.backend.turn_search_episodes(
+            list(dict.fromkeys(t.episode_id for t in picked.values()))))}
+        return sorted((t for t in picked.values() if t.episode_id in said_order),
+                      key=lambda t: (said_order[t.episode_id], t.part))
 
     def _reranks(self) -> bool:
         """Whether the decision provider re-ranks. The setting decides where it
@@ -3799,8 +3885,9 @@ class MemoryStore:
         and, when turn search is due (``turn_search_reasons``), a share for
         its excerpts (at most a quarter). Their source turns that best match
         the query fill the first share (``evidence``), turn search's turns
-        the second (``turn_search``). With filters no turns are searched:
-        the turns would not be held to the filters."""
+        the second (``turn_search``). The shares are ceilings: the memories
+        are packed last, into what the turns leave. With filters no turns
+        are searched: the turns would not be held to the filters."""
         cfg = self.config.retrieval
         if header:
             entities = []
@@ -3826,9 +3913,10 @@ class MemoryStore:
         excerpts = self.turn_search(query, shown, user_id=user_id, agent_id=agent_id,
                                     run_id=run_id, shown=turns, token_budget=quoted,
                                     note=note) if quoted else []
-        memory_context = build_context(shown, token_budget=remaining, evidence=turns,
+        # the shares are ceilings: what the turns leave goes to the memories
+        memory_context = build_context(results, token_budget=remaining, evidence=turns,
                                        excerpts=excerpts, asked=asked)
-        shown, turns, excerpts = packed(shown, token_budget=remaining, evidence=turns,
+        shown, turns, excerpts = packed(results, token_budget=remaining, evidence=turns,
                                         excerpts=excerpts, asked=asked)
         parts = [part for part in (entity_text, memory_context.text) if part]
         combined = "\n\n".join(parts)
@@ -7620,7 +7708,31 @@ class MemoryStore:
                 {e.id: v for e, v in zip(episodes, vectors)}, self.embedder.model_id)
             if not all(vectors):
                 break  # an episode the embedder gives no vector would come back forever
+        self.embed_passages(batch_size=batch_size)
         return count
+
+    def embed_passages(self, *, batch_size: int = 100, dry_run: bool = False) -> dict[str, int]:
+        """Embed the passages of longer episodes that have no vector of the
+        embedder's model yet (``models.Passage``): those of a store saved
+        before passages were kept. An episode's only passage has its vector
+        already. With ``dry_run``, count them and their words, with no call.
+        Returns {"passages", "words", "embedded"}."""
+        model = self.embedder.model_id
+        if dry_run or not self.embedder.dimensions:
+            waiting = self.backend.passages_to_embed(model, limit=10**9)
+            return {"passages": len(waiting),
+                    "words": sum(len(p.content.split()) for p in waiting), "embedded": 0}
+        done = {"passages": 0, "words": 0, "embedded": 0}
+        while parts := self.backend.passages_to_embed(model, limit=batch_size):
+            vectors = self.embedder.embed([p.content for p in parts])
+            self.backend.set_passage_vectors(
+                {p.id: v for p, v in zip(parts, vectors)}, model)
+            done["passages"] += len(parts)
+            done["words"] += sum(len(p.content.split()) for p in parts)
+            done["embedded"] += sum(1 for v in vectors if v)
+            if not all(vectors):
+                break  # a passage the embedder gives no vector would come back forever
+        return done
 
     def stats(self) -> dict[str, Any]:
         data = self.backend.stats()

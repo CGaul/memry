@@ -32,6 +32,7 @@ from ..models import (
     Memory,
     MemoryEvent,
     MergeProposal,
+    Passage,
     Relation,
     ENTITY_TYPES,
     HISTORY_KINDS,
@@ -44,6 +45,7 @@ from ..models import (
     utcnow,
 )
 from ..intelligence.extraction import looks_secret
+from ..intelligence.passages import passages_of as split_episode
 from .ann import HAS_USEARCH, HnswSidecar
 from .base import MemoryBackend
 
@@ -77,6 +79,34 @@ END;
 CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, content)
     VALUES ('delete', old.rowid, old.content);
+END;
+
+-- passages: an episode in parts of at most 150 words (``models.Passage``),
+-- which evidence and turn search use in place of whole episodes. An episode's
+-- only passage carries the episode's vector; the parts of a longer one are
+-- embedded on their own. They go with their episode.
+CREATE TABLE IF NOT EXISTS passages (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB DEFAULT NULL,
+    embedding_model TEXT DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_passages_episode ON passages(episode_id, position);
+CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
+    content, content='passages', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS passages_ai AFTER INSERT ON passages BEGIN
+    INSERT INTO passages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS passages_ad AFTER DELETE ON passages BEGIN
+    INSERT INTO passages_fts(passages_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS episodes_passages_ad AFTER DELETE ON episodes BEGIN
+    DELETE FROM passages WHERE episode_id = old.id;
 END;
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -865,6 +895,7 @@ class LocalBackend(MemoryBackend):
         self._db.executescript(_SCHEMA)
         if not indexed:
             self._db.execute("INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')")
+        self._ensure_passages()
         self._ensure_entity_description_columns()
         self._ensure_exact_topic_scopes()
         self._ensure_one_active_topic_per_name()
@@ -1238,7 +1269,40 @@ class LocalBackend(MemoryBackend):
                     for e in episodes
                 ],
             )
+            self._insert_passages([(e, None, None) for e in episodes])
             self._commit()
+
+    def _insert_passages(
+        self, rows: list[tuple[Episode, bytes | None, str | None]]
+    ) -> None:
+        """Write the passages of these episodes (``intelligence.passages``),
+        each episode with its vector and model, which its only passage takes.
+        Under the lock, uncommitted."""
+        values = []
+        for episode, vector, model in rows:
+            parts = split_episode(episode)
+            single = len(parts) == 1
+            values.extend((p.id, p.episode_id, p.position, p.count, p.content,
+                           vector if single else None, model if single else None)
+                          for p in parts)
+        self._db.executemany(
+            "INSERT OR IGNORE INTO passages (id, episode_id, position, count, content, "
+            "embedding, embedding_model) VALUES (?,?,?,?,?,?,?)", values)
+
+    def _ensure_passages(self) -> None:
+        """Write the passages of every episode saved before passages were
+        kept, in the order saved, with no provider call: an episode's only
+        passage takes its vector, a longer one's parts wait for theirs
+        (``passages_to_embed``)."""
+        while True:
+            rows = self._db.execute(
+                f"SELECT {_EPISODE_COLS}, embedding, embedding_model FROM episodes e "
+                "WHERE NOT EXISTS (SELECT 1 FROM passages p WHERE p.episode_id = e.id) "
+                "ORDER BY e.rowid LIMIT 2000").fetchall()
+            if not rows:
+                return
+            self._insert_passages([(_row_to_episode(r), r["embedding"], r["embedding_model"])
+                                   for r in rows])
 
     def list_episodes(self, scope: Scope, limit: int = 100) -> list[Episode]:
         clause, params = _scope_clause(scope)
@@ -1272,6 +1336,10 @@ class LocalBackend(MemoryBackend):
         with self._lock:
             self._db.executemany(
                 "UPDATE episodes SET embedding = ?, embedding_model = ? WHERE id = ?", rows)
+            # an episode's only passage is its whole text, so it has its vector
+            self._db.executemany(
+                "UPDATE passages SET embedding = ?, embedding_model = ? "
+                "WHERE episode_id = ? AND count = 1", rows)
             self._commit()
 
     def episode_vectors_of(
@@ -1492,6 +1560,131 @@ class LocalBackend(MemoryBackend):
             this = self._db.execute(
                 f"SELECT {_EPISODE_COLS} FROM episodes WHERE id = ?", (episode_id,)).fetchone()
         return [_row_to_episode(r) for r in [*reversed(earlier), this, *later]]
+
+    def passages_of(self, episode_ids: list[str]) -> dict[str, list[Passage]]:
+        ids = list(dict.fromkeys(episode_ids))
+        out: dict[str, list[Passage]] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT id, episode_id, position, count, content FROM passages "
+                    f"WHERE episode_id IN ({','.join('?' * len(chunk))}) "
+                    "ORDER BY episode_id, position", chunk).fetchall()
+            for r in rows:
+                out.setdefault(r["episode_id"], []).append(Passage(
+                    id=r["id"], episode_id=r["episode_id"], position=r["position"],
+                    count=r["count"], content=r["content"]))
+        return out
+
+    def set_passage_vectors(self, vectors: dict[str, list[float]], embedding_model: str) -> None:
+        rows = [(np.asarray(vector, dtype=np.float32).tobytes(), embedding_model, passage_id)
+                for passage_id, vector in vectors.items() if vector]
+        if not rows:
+            return
+        with self._lock:
+            self._db.executemany(
+                "UPDATE passages SET embedding = ?, embedding_model = ? WHERE id = ?", rows)
+            self._commit()
+
+    def passage_vectors_of(
+        self, passage_ids: list[str], embedding_model: str
+    ) -> dict[str, np.ndarray]:
+        out: dict[str, np.ndarray] = {}
+        ids = list(dict.fromkeys(passage_ids))
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            with self._lock:
+                rows = self._db.execute(
+                    f"SELECT id, embedding FROM passages WHERE id IN ({','.join('?' * len(chunk))}) "
+                    "AND embedding IS NOT NULL AND embedding_model = ?",
+                    (*chunk, embedding_model),
+                ).fetchall()
+            out.update((r["id"], np.frombuffer(r["embedding"], dtype=np.float32)) for r in rows)
+        return out
+
+    def passages_to_embed(self, embedding_model: str, *, limit: int = 1000) -> list[Passage]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, episode_id, position, count, content FROM passages "
+                "WHERE count > 1 AND embedding_model IS NOT ? ORDER BY rowid LIMIT ?",
+                (embedding_model, limit),
+            ).fetchall()
+        return [Passage(id=r["id"], episode_id=r["episode_id"], position=r["position"],
+                        count=r["count"], content=r["content"]) for r in rows]
+
+    def passage_keyword_scores(self, query: str, passage_ids: list[str]) -> dict[str, float]:
+        tokens = _WORD_RE.findall(query)
+        ids = list(dict.fromkeys(passage_ids))
+        if not tokens or not ids:
+            return {}
+        match = " OR ".join(f'"{t}"' for t in tokens[:32])
+        out: dict[str, float] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT p.id, bm25(passages_fts) AS rank_score FROM passages_fts "
+                    "JOIN passages p ON p.rowid = passages_fts.rowid "
+                    f"WHERE passages_fts MATCH ? AND p.id IN ({','.join('?' * len(chunk))})",
+                    (match, *chunk),
+                ).fetchall()
+            # bm25() is lower-is-better (negative); flipped to higher-is-better
+            out.update((r["id"], -float(r["rank_score"])) for r in rows)
+        return out
+
+    def passage_keyword_search(
+        self, query: str, scope: Scope, limit: int
+    ) -> list[tuple[str, float]]:
+        tokens = _WORD_RE.findall(query)
+        if not tokens or limit <= 0:
+            return []
+        match = " OR ".join(f'"{t}"' for t in tokens[:32])
+        clause, params = _scope_clause(scope, prefix="e.")
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT p.id, bm25(passages_fts) AS rank_score FROM passages_fts "
+                "JOIN passages p ON p.rowid = passages_fts.rowid "
+                "JOIN episodes e ON e.id = p.episode_id "
+                f"WHERE passages_fts MATCH ? AND {clause} AND e.withheld_at IS NULL "
+                "ORDER BY rank_score, p.rowid LIMIT ?",
+                (match, *params, limit),
+            ).fetchall()
+        return [(r["id"], -float(r["rank_score"])) for r in rows]
+
+    def passage_vector_search(
+        self, vector: list[float], embedding_model: str, scope: Scope, limit: int
+    ) -> list[tuple[str, float]]:
+        asked = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(asked))
+        if not norm or limit <= 0:
+            return []
+        asked /= norm
+        clause, params = _scope_clause(scope, prefix="e.")
+        best: list[tuple[float, int, str]] = []
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT p.rowid AS seq, p.id, p.embedding FROM passages p "
+                f"JOIN episodes e ON e.id = p.episode_id WHERE {clause} "
+                "AND e.withheld_at IS NULL AND p.embedding IS NOT NULL "
+                "AND p.embedding_model = ?",
+                (*params, embedding_model),
+            )
+            while rows := cursor.fetchmany(2000):
+                matrix = np.vstack([np.frombuffer(r["embedding"], dtype=np.float32)
+                                    for r in rows])
+                if matrix.shape[1] != asked.shape[0]:
+                    continue
+                norms = np.linalg.norm(matrix, axis=1)
+                norms[norms == 0] = 1.0
+                scores = (matrix @ asked) / norms
+                for r, score in zip(rows, scores):
+                    item = (float(score), -int(r["seq"]), r["id"])
+                    if len(best) < limit:
+                        heapq.heappush(best, item)
+                    elif item > best[0]:
+                        heapq.heapreplace(best, item)
+        return [(pid, round(score, 6)) for score, _, pid in sorted(best, reverse=True)]
 
     def history_ids(self, memory_ids: list[str]) -> set[str]:
         ids = list(dict.fromkeys(memory_ids))

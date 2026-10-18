@@ -22,6 +22,7 @@ from ..models import (
     Memory,
     MemoryEvent,
     MergeProposal,
+    Passage,
     Relation,
     Scope,
     TOPIC_TYPE,
@@ -111,6 +112,51 @@ class MemoryBackend(ABC):
         """The episode with up to ``before`` episodes said just before it and
         ``after`` said just after it, in the order said: of the same user,
         agent and run, said the same day. Empty for an unknown episode."""
+        return []
+
+    # Passages (``models.Passage``): an episode in parts of at most 150 words,
+    # which evidence and turn search use in place of whole episodes. A backend
+    # that keeps none has evidence and turn search read whole episodes.
+    def passages_of(self, episode_ids: list[str]) -> dict[str, list[Passage]]:
+        """Each of these episodes' passages, in order. An episode with none
+        stored is left out."""
+        return {}
+
+    def set_passage_vectors(self, vectors: dict[str, list[float]], embedding_model: str) -> None:
+        """Store these passages' vectors (passage id -> vector)."""
+
+    def passage_vectors_of(
+        self, passage_ids: list[str], embedding_model: str
+    ) -> dict[str, np.ndarray]:
+        """The stored vector of each of these passages embedded by
+        ``embedding_model``."""
+        return {}
+
+    def passages_to_embed(self, embedding_model: str, *, limit: int = 1000) -> list[Passage]:
+        """Passages of a longer episode with no vector of ``embedding_model``
+        yet, oldest first. An episode's only passage takes the episode's vector
+        and is never listed."""
+        return []
+
+    def passage_keyword_scores(self, query: str, passage_ids: list[str]) -> dict[str, float]:
+        """The full-text (BM25) score of each of these passages that matches
+        ``query``, higher is better; a passage that does not match is left out."""
+        return {}
+
+    def passage_keyword_search(
+        self, query: str, scope: Scope, limit: int
+    ) -> list[tuple[str, float]]:
+        """(passage id, BM25 score, higher is better) of the ``limit`` passages
+        of ``scope`` that best match ``query`` by their words, none of a
+        withheld episode."""
+        return []
+
+    def passage_vector_search(
+        self, vector: list[float], embedding_model: str, scope: Scope, limit: int
+    ) -> list[tuple[str, float]]:
+        """(passage id, cosine) of the ``limit`` passages of ``scope`` nearest
+        ``vector`` among those embedded by ``embedding_model``, none of a
+        withheld episode."""
         return []
 
     def history_ids(self, memory_ids: list[str]) -> set[str]:

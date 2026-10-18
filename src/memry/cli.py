@@ -11,6 +11,7 @@
     memry reindex                 re-embed all memories
     memry backfill-property-vectors  property vectors for the linked search
     memry backfill-questions      question keys for memories saved without them (--dry-run first)
+    memry backfill-passages       vectors of the passages of long messages (--dry-run first)
     memry write-entity-questions  entity questions for people related to the owner (--dry-run first)
     memry export / import         lossless backup/restore; legacy JSON imports
     memry search-stats [--days N] count the search log: searches with and without seeds
@@ -356,6 +357,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="at most this many memories per namespace")
 
     p = sub.add_parser(
+        "backfill-passages",
+        help="embed the passages of long messages saved before passages were kept "
+             "(only those with no vector)",
+    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="count the passages and their words; embed nothing")
+
+    p = sub.add_parser(
         "write-entity-questions",
         help="write the entity questions of the described people and things related to "
              "the owner (asks the text model; only new or changed ones)",
@@ -652,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
                      **store.backfill_questions(user_id=uid, exact_user=True,
                                                 limit=args.limit, dry_run=args.dry_run)}
                     for uid in namespaces])
+        elif args.command == "backfill-passages":
+            _print({"dry_run": args.dry_run, **store.embed_passages(dry_run=args.dry_run)})
         elif args.command == "write-entity-questions":
             if not args.dry_run and not store.llm.available:
                 print("no LLM configured; writing entity questions needs one", file=sys.stderr)

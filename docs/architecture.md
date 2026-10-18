@@ -931,6 +931,23 @@ entity or date filter, whether its question names anything, and with `relational
    they are returned in the order they were said. A result carries the turns credited to
    it (`SearchResult.evidence`).
 
+   The unit shown is a passage (`intelligence.passages`, `models.Passage`). A message of
+   more than 150 words is stored with its passages of at most 150 words: whole paragraphs
+   packed while they fit, a longer paragraph split at sentence ends, a single sentence (or
+   code) at line breaks, and anything still longer every 150 words. A message of 150 words
+   or fewer is one passage of its whole text and has the message's vector. The evidence
+   candidates are the passages of the source episodes, each taken by its own vector and
+   full-text match, and one a memory says whole is left out. A passage of a longer message
+   reads "<said date>: <speaker> (part 2 of 5): <text>". The reason: a turn is shown whole
+   or not at all, and the shares are a few hundred tokens. On BEAM's 100K chats the
+   assistant's replies have a median of 950 tokens, and 11.5% fit within 600; on
+   LongMemEval 78.6% of them are over 150 words. Search scores long documents by passages
+   of about 150 words for the same reason (Dai and Callan 2019). 150 is fixed from there:
+   about 200 tokens, below the smallest share (a quarter of the default 1,200 tokens), so
+   any passage fits any share on its own. LoCoMo's longest message has 87 words, so its
+   chats read as before. A store saved before passages gets them when it opens, with no
+   call; `memry backfill-passages` (or `reindex`) embeds the parts of its long messages.
+
    Turn search (`retrieval.turn_search`, on by default) is a second search over the
    turns, run when the judge gave no fact shown a relevance at
    `retrieval.turn_search_bar` (0.8); a search nobody judged never runs it
@@ -942,12 +959,14 @@ entity or date filter, whether its question names anything, and with `relational
    too when extraction kept nothing of its save, when a delete touched its save (a turn
    withheld, or under a removed memory; a save is its scope and its time), and when it
    looks like a secret (`extraction.looks_secret`), since it may be what extraction
-   refused. The first 16 are each read with the turn said before and the two said after,
-   of the same run and day. The decision provider judges these excerpts in one call, and
-   those judged at `retrieval.turn_search_keep` (0.5) are taken, the best first, within
-   `retrieval.turn_search_tokens` (400). `reconstruct_context` shows their turns after the
-   evidence under a heading of their own, dated as the evidence is, and reserves their
-   share of the budget first; a filtered context runs none. The MCP `search_memories`
+   refused. It searches passages: the first 16 are each read with the passage before
+   them and then the two after them, of the same run and day, each added while the excerpt
+   fits the budget on its own, so the decision provider judges what would be shown. It
+   judges these excerpts in one call, and those judged at `retrieval.turn_search_keep`
+   (0.5) are taken, the best first, within `retrieval.turn_search_tokens` (400).
+   `reconstruct_context` shows their turns after the evidence under a heading of their
+   own, dated as the evidence is, and holds their share of the budget as a ceiling; a
+   filtered context runs none. The MCP `search_memories`
    rows carry them as "excerpts" on the first row, written as the evidence is
    (`search_filtered` with `excerpts`), except for a filtered search.
    Memry also runs it in two more cases, both read from the judge's first call
@@ -962,7 +981,9 @@ descriptions of the entities the query names (`described_entities`: the first th
 names, each description refreshed where stale, as many as fit a quarter of the budget,
 from 80 to 300 tokens). It then packs exact memories into the remaining token
 budget, leaving a share for their evidence (`retrieval.evidence_tokens`, at most half of
-what is left). The evidence of the memories that fit fills that share. One function
+what is left). The evidence of the memories that fit fills that share. The shares are
+ceilings: once the turns are chosen, the memories are packed again into what the turns
+leave, so a context whose turns take less than their share shows more memories. One function
 renders a context for a model (`intelligence.context.context_lines`), used by
 `reconstruct_context` and the benchmark runner alike. An entity reads "Caroline
 (person): <description>". A memory reads "[happened

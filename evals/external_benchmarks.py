@@ -1524,14 +1524,17 @@ def kept_excerpts(store: MemoryStore, note: dict[str, Any]) -> list[dict[str, An
     without asking the judge again (``evals.beam_eval``, context "turns:N")."""
     excerpts = note.get("excerpts") or []
     ids = list(dict.fromkeys(e for item in excerpts for e in item.get("new_ids") or []))
-    said = store.backend.turn_search_episodes(ids)
-    place = {episode.id: i for i, episode in enumerate(said)}
-    line = {episode.id: turn_line(EvidenceTurn(episode_id=episode.id, content=episode.content,
-                                               speaker=episode.speaker,
-                                               said_at=episode.created_at))
-            for episode in said}
+    turns = store._passage_turns(store.backend.turn_search_episodes(ids))
+    place: dict[str, int] = {}
+    line: dict[str, str] = {}
+    for i, turn in enumerate(turns):
+        for key in {turn.passage_id or turn.episode_id, turn.episode_id} if turn.parts == 1 \
+                else {turn.passage_id or turn.episode_id}:
+            place[key], line[key] = i, turn_line(turn)
     return [{"score": item.get("score"), "tokens": item.get("tokens"),
-             "turns": [[place[e], line[e]] for e in item.get("new_ids") or [] if e in line]}
+             "turns": [[place[k], line[k]]
+                       for k in item.get("new_passage_ids", item.get("new_ids")) or []
+                       if k in line]}
             for item in excerpts]
 
 
@@ -2990,6 +2993,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "source turns chosen within N tokens instead, for the same "
                              "memories and without turn search's turns "
                              "(context_lines_evidence); no model call")
+    parser.add_argument("--context-tokens", type=int, default=None, metavar="N",
+                        help=f"the budget of each answer's context (default {CONTEXT_TOKENS}); "
+                             "1200 is what an agent gets through MCP by default")
     parser.add_argument("--contexts-only", action="store_true",
                         help="build and keep every answer's context (implies --keep-context), "
                              "with turn search, but make no answering or judging call")
@@ -3245,8 +3251,10 @@ def write_selected(dataset: str, path: pathlib.Path, conversations: list[Convers
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
-    global KEEP_CONTEXT, KEEP_EVIDENCE_TOKENS, CONTEXTS_ONLY
+    global KEEP_CONTEXT, KEEP_EVIDENCE_TOKENS, CONTEXTS_ONLY, CONTEXT_TOKENS
     CONTEXTS_ONLY = args.contexts_only
+    if args.context_tokens:
+        CONTEXT_TOKENS = args.context_tokens
     KEEP_CONTEXT = args.keep_context or args.contexts_only
     KEEP_EVIDENCE_TOKENS = tuple(args.keep_evidence_tokens or ())
     if not args.coverage_audit:

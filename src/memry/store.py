@@ -419,6 +419,9 @@ TURN_AFTER = 2
 COMPLETE_QUESTION = ("These facts, read together, contain everything the question asks "
                      "for, about the person or thing it asks about. The question as asked: "
                      "{question}\nFacts:\n{facts}")
+#: The topic pick's question about each tag or named thing
+#: (``MemoryStore._picked_entities``), asked of the question as asked.
+PICK_QUESTION = "Some of the memories that answer the question are about {label}."
 #: Keys from traffic (``MemoryStore._traffic_keys``): a save may answer the
 #: searches of its run this long before it, and those of its namespace this
 #: long before it; at most this many searches are read a save, each ordered
@@ -3401,9 +3404,11 @@ class MemoryStore:
           groceries?"): one more call judges up to ``retrieval.set_pool``
           memories more that the search reads (``_set_pool``), and the
           members of the set are found over both calls' scores
-          (``set_members``).
-        The "calls" signal says how many calls were made (1 or 2), "pool" how
-        many memories the second judged.
+          (``set_members``). With ``retrieval.topic_pick``, a call before it
+          picks the tags and named things the answer is about
+          (``_picked_entities``), and their memories come first in that pool.
+        The "calls" signal says how many calls were made (1 to 3), "pool" how
+        many memories the set call judged.
 
         With one seed, "it" stands for each memory's own entity (the one the
         links reach most strongly, a tie by entity id) in the question and
@@ -3490,17 +3495,21 @@ class MemoryStore:
                     asked = self._asked_vector(question)
                 except Exception:  # embedding service down: the batch keeps its order
                     asked = None
+            picked = (self._picked_entities(plan.query or question, scope)
+                      if cfg.topic_pick else None)
             batch = self._set_pool(ranked, size, judged, scope, include_invalid,
                                    asked=asked, act=act, entities=entities,
                                    members=set_members(judged), names_kept=len(seeds) > 1,
-                                   reads=plan.reads)
+                                   reads=plan.reads, picked=picked or ())
+            if picked is not None:
+                calls += 1
             if batch:
                 for result in batch:
                     if result.memory.id not in found:
                         found[result.memory.id] = result
                         extra.append(result)
                 got, _, _ = judge(batch, False)
-                calls, pooled = 2, len(batch)
+                calls, pooled = calls + 1, len(batch)
                 judged.update(got)
             members = set_members(judged)
         # What is true of the thing a seed belongs to holds for the seed only
@@ -3573,12 +3582,17 @@ class MemoryStore:
         self, ranked: list[SearchResult], size: int, judged: dict[str, float], scope: Scope,
         include_invalid: bool, *, asked: np.ndarray | None, act: dict[str, float],
         entities: dict[str, list[Entity]], members: set[str], names_kept: bool = False,
-        reads: _Reads | None = None,
+        reads: _Reads | None = None, picked: list[str] | tuple[str, ...] = (),
     ) -> list[SearchResult]:
         """What the second call of a question needing several memories judges:
         at most ``retrieval.set_pool`` memories not judged yet, of those the
         search reads (``reads``: its scope and run, history, tags, entity and
         date windows, as the first call's).
+
+        The memories of the ``picked`` tags and named things
+        (``_picked_entities``; the newest ``SET_SCAN`` of each) come first, the
+        best by the linked search's order while they fit the budget. The rest
+        of the budget is filled as follows.
 
         The members of a set are the same kind of fact and filed under the same
         topics (tags). So the topics that at least ``SET_SHARED`` of the first
@@ -3619,6 +3633,23 @@ class MemoryStore:
 
         first = [r.memory.id for r in ranked[:size]]
         done = set(first) | set(judged)
+        known = {r.memory.id: r for r in ranked}
+        lead: list[SearchResult] = []
+        lead_order: dict[str, float] = {}
+        if picked:
+            chosen_memories: dict[str, Memory] = {}
+            for entity_id in picked:
+                for memory in reads.entity_memories(self.backend, entity_id, SET_SCAN):
+                    if memory.id not in done:
+                        chosen_memories.setdefault(memory.id, memory)
+            lead_order = linked_order(list(chosen_memories))
+            best = sorted(chosen_memories, key=lambda mid: (-lead_order[mid], mid))[:budget]
+            lead = [known.get(mid) or SearchResult(memory=chosen_memories[mid], score=0.0)
+                    for mid in best]
+            done |= set(best)
+            budget -= len(lead)
+            if budget <= 0:
+                return sorted(lead, key=lambda r: -lead_order[r.memory.id])
         topics = self.backend.entities_of_memories(first, kind="topic")
         carried = Counter(topic.id for mid in first for topic in topics.get(mid, []))
         shared = [topic_id for topic_id, count in carried.items() if count >= SET_SHARED]
@@ -3637,8 +3668,7 @@ class MemoryStore:
                     continue
                 memories[memory.id] = memory
                 walk[memory.id] += share
-        known = {r.memory.id: r for r in ranked}
-        order: dict[str, float] = {}
+        order: dict[str, float] = dict(lead_order)
         batch: list[SearchResult] = []
         if walk:
             # by the share, then the newest first, then by memory id: a key
@@ -3654,7 +3684,7 @@ class MemoryStore:
             chosen = [mid for mid in best if round(walk[mid], 9) > edge]
             tied = [mid for mid in best if round(walk[mid], 9) == edge]
             tied = tied[: max(budget - len(chosen), 0) + SET_TIE_MARGIN]
-            order = linked_order(chosen + tied)
+            order.update(linked_order(chosen + tied))
             tied = sorted(tied, key=lambda mid: -order[mid])
             best = chosen + tied[: max(budget - len(chosen), 0)]
             batch = [known.get(mid) or SearchResult(memory=memories[mid], score=0.0)
@@ -3668,7 +3698,7 @@ class MemoryStore:
                 rest = [r for r in ranked[size:] if r.memory.id not in done][:budget]
             order.update(linked_order([r.memory.id for r in rest]))
             batch += rest
-        return sorted(batch, key=lambda r: -order[r.memory.id])
+        return sorted(lead + batch, key=lambda r: -order[r.memory.id])
 
     def _nearest_unjudged(
         self, members: set[str], taken: set[str], scope: Scope, include_invalid: bool,
@@ -3710,6 +3740,34 @@ class MemoryStore:
             # a tie keeps the order of the memory vectors
             rest.sort(key=lambda m: -_similarity(alike, vectors.get(m.id)))
         return picked + rest[: count - len(picked)]
+
+    def _picked_entities(self, question: str, scope: Scope) -> list[str] | None:
+        """The topic pick (``retrieval.topic_pick``): the tags and named
+        things of ``scope`` that the answer to ``question`` is about, the
+        likeliest first. The decision provider reads the
+        ``retrieval.topic_pick_pool`` mentioned most recently in one call
+        (``PICK_QUESTION``, a tag read as "the topic ..." and a named thing
+        with its type), and each judged at ``retrieval.topic_pick_bar`` or more
+        is picked. None when no call was made: no provider, or nothing to read."""
+        cfg = self.config.retrieval
+        if not self.decider.available or cfg.topic_pick_pool <= 0:
+            return None
+        entities = self.backend.list_entities(scope, kind="any", limit=cfg.topic_pick_pool)
+        if not entities:
+            return None
+
+        def label(entity: Entity) -> str:
+            if entity.entity_type == TOPIC_TYPE:
+                return f'the topic "{entity.name}"'
+            return f"{entity.name} ({entity.entity_type})" if entity.entity_type else entity.name
+
+        questions = {f"e{i}": Noul(instructions=PICK_QUESTION.format(label=label(e)))
+                     for i, e in enumerate(entities)}
+        answers = self.decider.decide(f"QUESTION: {question}", questions)
+        scored = [(float(answers[key].value), i) for i, key in enumerate(questions)
+                  if answers[key].available]
+        return [entities[i].id for value, i in sorted(scored, key=lambda x: (-x[0], x[1]))
+                if value >= cfg.topic_pick_bar]
 
     def _judged_relevance(
         self, asked: str, memories: list[tuple[str, str]], meta: bool = True,

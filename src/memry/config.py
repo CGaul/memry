@@ -266,6 +266,18 @@ class RetrievalConfig(BaseModel):
     #: context, so they never push a memory out. 0, the default, shows none
     #: (``MEMRY_SIMILAR_TURNS``; the benchmark runner's ``--similar-turns``).
     similar_turns: int = 0
+    #: The topic pick (``MemoryStore._picked_entities``). For a question that
+    #: needs several memories (the set call), the decision provider reads the
+    #: ``topic_pick_pool`` tags and named things of the scope mentioned most
+    #: recently, in one more call, and picks those the answer is filed under
+    #: or about, each at ``topic_pick_bar`` or more. Their memories come first
+    #: in the set call's pool (``MemoryStore._set_pool``). A walk down a tree
+    #: of kinds starts from a kind the question names ("which cities"); at
+    #: this size one call reads every tag and name instead. Off by default
+    #: (``MEMRY_TOPIC_PICK``).
+    topic_pick: bool = False
+    topic_pick_pool: int = 100
+    topic_pick_bar: float = 0.5
 
     @field_validator("relational_mode", "relational_fusion", mode="before")
     @classmethod
@@ -592,6 +604,7 @@ def _from_env() -> dict[str, Any]:
     put_bar("retrieval", "turn_search_several", e("MEMRY_TURN_SEARCH_SEVERAL"))
     put_bar("retrieval", "turn_search_complete", e("MEMRY_TURN_SEARCH_COMPLETE"))
     put("retrieval", "similar_turns", _int(e("MEMRY_SIMILAR_TURNS")))
+    put("retrieval", "topic_pick", _bool(e("MEMRY_TOPIC_PICK")))
 
     put("embedding", "provider", e("MEMRY_EMBEDDING_PROVIDER"))
     put("embedding", "model", e("MEMRY_EMBEDDING_MODEL"))

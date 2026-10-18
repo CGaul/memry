@@ -898,7 +898,15 @@ entity or date filter, whether its question names anything, and with `relational
    the memories nearest to the members the first call found, half by memory vector and
    half by property vector (with the names read "it", one car's price is nearest other
    prices, not that car's other facts). Only with no member to start from is it the order
-   past the first 20. The set's members are found over both calls' scores.
+   past the first 20. The set's members are found over both calls' scores. With
+   `retrieval.topic_pick` on (off by default), one call before the set call asks the decision
+   model, for each of the `topic_pick_pool` (100) tags and named things of the scope mentioned
+   most recently, whether some of the memories that answer the question are about it (a tag
+   read as "the topic ...", a named thing with its type). The memories of those it picks at
+   `topic_pick_bar` (0.5) or more come first in the set call's budget, the best by the linked
+   order. A tree of kinds, walked down from a kind the question names ("which cities"), is
+   the other way to reach them; at the size of a person's tags and names one call reads them
+   all.
 7. **Final order, limit, evidence**. A judged search is ordered by the judged score, times
    aboutness with seeds, the set's members first; they are returned past the limit, up to
    100. With seeds, an answer from a thing the named entity belongs to counts as far as

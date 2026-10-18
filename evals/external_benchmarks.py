@@ -1464,6 +1464,9 @@ class NoAnswer:
     def complete(self, system: str, user: str, **_: Any) -> str:
         raise AssertionError("--contexts-only makes no answering call")
 
+    def close(self) -> None:
+        pass
+
 
 def context_list(context: AgentContext, *, excerpts: bool = True) -> list[str]:
     """An agent's context as the answer prompt's memory list: the lines of

@@ -151,7 +151,8 @@ def test_a_run_writes_its_metadata_beside_the_results_and_prints_it_first(
     # every answer's context is the product's, at the runner's budget, turn search on
     assert config["context_tokens"] == xb.CONTEXT_TOKENS == 4000
     assert config["turn_search_in_stores"] == {"on": True, "bar": 0.8, "several": 0.5,
-                                               "complete": 0.7, "keep": 0.5, "tokens": 400}
+                                               "complete": 0.7, "keep": 0.5, "tokens": 400,
+                                               "similar": 0}
     # the results file names the store's decider option, not the pass's provider
     assert result["config"]["decider"] == "config"
 

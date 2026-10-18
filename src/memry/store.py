@@ -669,7 +669,8 @@ class AgentContext:
     results: list[SearchResult]
     #: The source turns shown as the memories' evidence, in the order said.
     evidence: list[EvidenceTurn]
-    #: Turn search's turns, in the order said.
+    #: The turns shown after the evidence, under a heading of their own, in
+    #: the order said: turn search's and the similar turns (``similar``).
     excerpts: list[EvidenceTurn]
     #: Turn search's note (``MemoryStore.turn_search``): "why" (its
     #: triggers, none when it was not due), "due" and "best" always;
@@ -677,6 +678,9 @@ class AgentContext:
     #: were searched.
     turn_search: dict[str, Any]
     context: ContextResult
+    #: Of ``excerpts``, the turns most similar to the question
+    #: (``MemoryStore.similar_turns``), in the order said.
+    similar: list[EvidenceTurn] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -795,6 +799,18 @@ def _turn_key(turn: EvidenceTurn) -> str:
     """A turn's identity: its passage, or its episode for a turn of a whole
     episode."""
     return turn.passage_id or turn.episode_id
+
+
+def _said_texts(results: list[SearchResult]) -> list[str]:
+    """The results' texts as ``_says_whole`` compares them."""
+    return [" ".join(r.memory.content.casefold().split()) for r in results]
+
+
+def _says_whole(turn: EvidenceTurn, said: list[str]) -> bool:
+    """Whether one of ``said`` (``_said_texts``) has the turn's words whole,
+    as a verbatim save has them."""
+    words = " ".join(turn.content.casefold().split())
+    return any(words in text for text in said)
 
 
 def _similarity(asked: np.ndarray, vector: np.ndarray | None) -> float:
@@ -3073,33 +3089,18 @@ class MemoryStore:
         budget = cfg.turn_search_tokens if token_budget is None else token_budget
         if budget <= 0 or not (query or "").strip() or not self.decider.available:
             return []
-        if query_vector is None:
-            query_vector = self._query_vector(query)
-        fused: dict[str, float] = defaultdict(float)
-        lists = [self.backend.passage_keyword_search(query, scope, TURN_CANDIDATES)]
-        if query_vector:
-            lists.append(self.backend.passage_vector_search(
-                query_vector, self.embedder.model_id, scope, TURN_CANDIDATES))
-        for found in lists:
-            for rank, (passage_id, _) in enumerate(found, start=1):
-                fused[passage_id] += 1.0 / (cfg.rrf_k + rank)
-        order = sorted(fused, key=lambda p: -fused[p])  # a tie: words first, as found
-        note["candidates"] = len(order)
-        said = [" ".join(r.memory.content.casefold().split()) for r in results]
+        candidates = self._turn_candidates(query, results, scope=scope, shown=shown,
+                                           query_vector=query_vector, note=note)
+        hits = [_turn_key(turn) for turn in candidates][:TURN_HITS]
+        said = _said_texts(results)
 
         def says_whole(turn: EvidenceTurn) -> bool:
-            words = " ".join(turn.content.casefold().split())
-            return any(words in text for text in said)
+            return _says_whole(turn, said)
 
         def episode_of(passage_id: str) -> str:
             return passage_id.rpartition(":")[0]
 
         seen = {_turn_key(t) for t in shown}
-        allowed = {e.id: e for e in self.backend.turn_search_episodes(
-            list(dict.fromkeys(episode_of(p) for p in order)))}
-        found = {_turn_key(turn): turn for turn in self._passage_turns(list(allowed.values()))}
-        hits = [p for p in order
-                if p in found and p not in seen and not says_whole(found[p])][:TURN_HITS]
         taken: set[str] = set()
         excerpts: list[dict[str, Any]] = []
         for hit in hits:
@@ -3166,11 +3167,78 @@ class MemoryStore:
         note["chosen"] = chosen
         picked = {_turn_key(t): t.model_copy(update={"score": round(excerpts[i]["score"], 6)})
                   for i in chosen for t in excerpts[i]["new"]}
-        # in the order said: time, then the order saved, then the part
-        said_order = {e.id: n for n, e in enumerate(self.backend.turn_search_episodes(
-            list(dict.fromkeys(t.episode_id for t in picked.values()))))}
-        return sorted((t for t in picked.values() if t.episode_id in said_order),
-                      key=lambda t: (said_order[t.episode_id], t.part))
+        return self._in_said_order(list(picked.values()))
+
+    def _turn_candidates(
+        self, query: str, results: list[SearchResult], *, scope: Scope,
+        shown: list[EvidenceTurn] | tuple[EvidenceTurn, ...],
+        query_vector: list[float] | None, note: dict[str, Any] | None = None,
+    ) -> list[EvidenceTurn]:
+        """The turns said in ``scope`` that match ``query``, best first, as
+        turn search and the similar turns find them: by their words (BM25)
+        and by their vectors (``query_vector``, or the query's own),
+        ``TURN_CANDIDATES`` of each, fused by rank, a tie words first. A turn
+        is left out when it is shown already (``shown``), when turn search
+        may not show it (``MemoryBackend.turn_search_episodes``: withheld,
+        resting under a removed memory, or only under memories out of use),
+        or when a result already says its words whole. ``note`` receives
+        "candidates": how many were found before any was left out."""
+        if query_vector is None:
+            query_vector = self._query_vector(query)
+        rrf_k = self.config.retrieval.rrf_k
+        fused: dict[str, float] = defaultdict(float)
+        lists = [self.backend.passage_keyword_search(query, scope, TURN_CANDIDATES)]
+        if query_vector:
+            lists.append(self.backend.passage_vector_search(
+                query_vector, self.embedder.model_id, scope, TURN_CANDIDATES))
+        for found in lists:
+            for rank, (passage_id, _) in enumerate(found, start=1):
+                fused[passage_id] += 1.0 / (rrf_k + rank)
+        order = sorted(fused, key=lambda p: -fused[p])  # a tie: words first, as found
+        if note is not None:
+            note["candidates"] = len(order)
+        said = _said_texts(results)
+        seen = {_turn_key(t) for t in shown}
+        allowed = self.backend.turn_search_episodes(
+            list(dict.fromkeys(p.rpartition(":")[0] for p in order)))
+        found = {_turn_key(turn): turn for turn in self._passage_turns(allowed)}
+        return [found[p] for p in order
+                if p in found and p not in seen and not _says_whole(found[p], said)]
+
+    def _in_said_order(self, turns: list[EvidenceTurn]) -> list[EvidenceTurn]:
+        """These turns in the order said: time, then the order saved, then
+        the part. A turn turn search may not show is left out."""
+        order = {e.id: n for n, e in enumerate(self.backend.turn_search_episodes(
+            list(dict.fromkeys(t.episode_id for t in turns))))}
+        return sorted((t for t in turns if t.episode_id in order),
+                      key=lambda t: (order[t.episode_id], t.part))
+
+    def similar_turns(
+        self,
+        query: str,
+        results: list[SearchResult],
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        shown: list[EvidenceTurn] | tuple[EvidenceTurn, ...] = (),
+        query_vector: list[float] | None = None,
+        limit: int | None = None,
+    ) -> list[EvidenceTurn]:
+        """The turns said in the scope searched that are most similar to
+        ``query``, best first, up to ``limit`` (default
+        ``retrieval.similar_turns``): turn search's candidates
+        (``_turn_candidates``), on every search and with no judge. A turn is
+        left out when it is shown already (``shown``), when it may not be
+        shown, or when a result (``results``, the memories shown) already
+        says its words whole. ``context_from`` shows them with turn search's
+        turns, each while it fits what the rest of the context leaves."""
+        limit = self.config.retrieval.similar_turns if limit is None else limit
+        if limit <= 0 or not (query or "").strip():
+            return []
+        return self._turn_candidates(
+            query, results, scope=Scope(user_id=user_id, agent_id=agent_id, run_id=run_id),
+            shown=shown, query_vector=query_vector)[:limit]
 
     def _reranks(self) -> bool:
         """Whether the decision provider re-ranks. The setting decides where it
@@ -3808,7 +3876,8 @@ class MemoryStore:
         but a share for their evidence (``retrieval.evidence_tokens``, at most
         half of what is left), and their source turns that best match the
         query fill that share (``evidence``). When turn search is due, its
-        turns take a share of their own (``_context``). The steps after the
+        turns take a share of their own, and the turns most similar to the
+        query take what is left (``_context``). The steps after the
         search are ``context_from``'s, which the benchmark runner calls.
 
         With ``filters`` only memories they admit are shown, so no entity
@@ -3886,8 +3955,11 @@ class MemoryStore:
         its excerpts (at most a quarter). Their source turns that best match
         the query fill the first share (``evidence``), turn search's turns
         the second (``turn_search``). The shares are ceilings: the memories
-        are packed last, into what the turns leave. With filters no turns
-        are searched: the turns would not be held to the filters."""
+        are packed last, into what the turns leave. The turns most similar
+        to the question (``similar_turns``) come after that, each while every
+        memory shown still fits, and are shown with turn search's turns in
+        the order said. With filters no turns are searched: the turns would
+        not be held to the filters."""
         cfg = self.config.retrieval
         if header:
             entities = []
@@ -3913,6 +3985,27 @@ class MemoryStore:
         excerpts = self.turn_search(query, shown, user_id=user_id, agent_id=agent_id,
                                     run_id=run_id, shown=turns, token_budget=quoted,
                                     note=note) if quoted else []
+        # the similar turns take only what the rest leaves: each is shown
+        # while every memory shown beside the other turns still fits
+        similar: list[EvidenceTurn] = []
+        kept = packed(results, token_budget=remaining, evidence=turns, excerpts=excerpts,
+                      asked=asked)[0]
+        if kept and not header and cfg.similar_turns > 0:
+            found = self.similar_turns(query, kept, user_id=user_id, agent_id=agent_id,
+                                       run_id=run_id, shown=[*turns, *excerpts])
+            order = {_turn_key(t): i for i, t in
+                     enumerate(self._in_said_order([*excerpts, *found]))}
+
+            def said(turn: EvidenceTurn) -> int:
+                return order.get(_turn_key(turn), len(order))
+
+            for turn in found:
+                trial = sorted([*excerpts, *similar, turn], key=said)
+                if len(packed(results, token_budget=remaining, evidence=turns, excerpts=trial,
+                              asked=asked)[0]) == len(kept):
+                    similar.append(turn)
+            similar.sort(key=said)
+            excerpts = sorted([*excerpts, *similar], key=said)
         # the shares are ceilings: what the turns leave goes to the memories
         memory_context = build_context(results, token_budget=remaining, evidence=turns,
                                        excerpts=excerpts, asked=asked)
@@ -3929,7 +4022,8 @@ class MemoryStore:
                 memory_ids=memory_ids,
                 token_estimate=estimate_tokens(combined) if combined else 0,
                 episode_ids=memory_context.episode_ids,
-            ))
+            ),
+            similar=similar if excerpts else [])
 
     @staticmethod
     def _asked_bounds(period: Any) -> tuple[date | None, date | None] | None:

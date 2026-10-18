@@ -976,6 +976,15 @@ entity or date filter, whether its question names anything, and with `relational
    - P(the facts judged, read together, contain everything asked) is under
      `retrieval.turn_search_complete` (0.7), a question added to that call.
 
+   The turns most similar to the question (`MemoryStore.similar_turns`) are found the same
+   way, by words and by vectors over the passages of the scope, fused by rank, on every
+   context and with no judge. Up to `retrieval.similar_turns` of them are shown (0 by
+   default, so none), the most similar first, each while every memory shown still fits: they take only what the
+   memories, the evidence and turn search's turns leave of the budget, so they never push
+   a memory out. A turn already shown, one turn search may not show, and one whose words a
+   memory says whole are left out. They are shown with turn search's turns, in the order
+   said. The MCP `search_memories` rows do not carry them.
+
 Context reconstruction (`reconstruct_context`) runs a search and puts first the
 descriptions of the entities the query names (`described_entities`: the first three it
 names, each description refreshed where stale, as many as fit a quarter of the budget,
@@ -996,7 +1005,8 @@ day the memory that replaced it was said, written as that memory's "said" date i
 memories are followed by their evidence turns in the order they were said, each "<said
 date>: <speaker>: <text>", the speaker being the message's `name` when it gave one, else
 its role (an episode saved before names were kept shows its role). Turn search's turns
-come last, written the same way. The role still decides
+and the turns most similar to the question come last, in the order said, written the
+same way. The role still decides
 what a role decides, such as whether "the user" is the owner. The MCP `search_memories` rows carry the same as data: `said`,
 `happened`, `invalid_at` for a memory out of use, and `evidence` (said, speaker, text);
 the first row also has `excerpts` when turn search ran. The benchmark runner answers each

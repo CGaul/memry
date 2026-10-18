@@ -1472,10 +1472,19 @@ def context_list(context: AgentContext, *, excerpts: bool = True) -> list[str]:
     """An agent's context as the answer prompt's memory list: the lines of
     the text an agent reads (``context.context.text``), in its order,
     without its headings (``context_lines``): the descriptions, the
-    memories, their evidence turns, then turn search's turns (none with
-    ``excerpts`` false)."""
+    memories, their evidence turns, then turn search's turns and the turns
+    most similar to the question (with ``excerpts`` false, the similar
+    turns only)."""
     return context_lines(context.entities, [r.memory for r in context.results],
-                         context.evidence, excerpts=context.excerpts if excerpts else ())
+                         context.evidence,
+                         excerpts=context.excerpts if excerpts else context.similar)
+
+
+def searched_turns(context: AgentContext) -> list[Any]:
+    """The turns turn search added to a context: its excerpts but the
+    similar turns."""
+    similar = {t.passage_id or t.episode_id for t in context.similar}
+    return [t for t in context.excerpts if (t.passage_id or t.episode_id) not in similar]
 
 
 def at_k(results: list[Any], k: int, *, every: bool = True) -> list[Any]:
@@ -1501,8 +1510,9 @@ def turn_search_record(context: AgentContext,
     None without tiktoken; the harness's own list for None) and those the
     store's budget counts (``budget_tokens``)."""
     note = context.turn_search
+    searched = searched_turns(context)
     tokens: int | None = 0
-    if context.excerpts:
+    if searched:
         full = count_tokens(context_text(answer_prompt, context_list(context)))
         bare = count_tokens(context_text(answer_prompt, context_list(context, excerpts=False)))
         tokens = full - bare if full is not None and bare is not None else None
@@ -1510,9 +1520,16 @@ def turn_search_record(context: AgentContext,
     return {"ran": "candidates" in note, "why": list(note.get("why") or []),
             "best": round(best, 4) if best is not None else None,
             "judged": len(note.get("excerpts") or []),
-            "excerpts": len(note.get("chosen") or []) if context.excerpts else 0,
-            "turns": len(context.excerpts), "tokens": tokens,
-            "budget_tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in context.excerpts)}
+            "excerpts": len(note.get("chosen") or []) if searched else 0,
+            "turns": len(searched), "tokens": tokens,
+            "budget_tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in searched)}
+
+
+def similar_record(context: AgentContext) -> dict[str, Any]:
+    """The similar turns of one context (``MemoryStore.similar_turns``): how
+    many were shown and their tokens as the store's budget counts them."""
+    return {"turns": len(context.similar),
+            "budget_tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in context.similar)}
 
 
 def kept_excerpts(store: MemoryStore, note: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1552,7 +1569,7 @@ def answer_with(answer_llm: LLM, question: Question, context: AgentContext,
     record["k"] = len(context.results)
     if KEEP_CONTEXT:
         record["context_lines"] = [line if isinstance(line, str) else str(line) for line in lines]
-        if context.excerpts:
+        if searched_turns(context):
             record["context_lines_bare"] = [
                 line if isinstance(line, str) else str(line)
                 for line in context_list(context, excerpts=False)]
@@ -1595,7 +1612,7 @@ def answer_from(answer_llm: LLM, question: Question, items: list[Any],
 ANSWER_FIELDS = ("prediction", "answer_error", "answer_seconds", "context_tokens",
                  "input_tokens", "f1", "em", "contains", "f1_mem0", "bleu1", "judge", "judges",
                  "judge_error", "judge_corrected", "judges_corrected", "judge_clean",
-                 "turn_search")
+                 "turn_search", "similar")
 
 
 def judge_answers(answers: dict[Any, dict[str, Any]], question: Question, judge: Judge,
@@ -1769,9 +1786,12 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
         record["evidence"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
                               for t in context.evidence]
         record["excerpt_turns"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
-                                   for t in context.excerpts]
+                                   for t in searched_turns(context)]
+        record["similar_turns"] = [ingested.turn_of_episode.get(t.episode_id, t.episode_id)
+                                   for t in context.similar]
         record["turn_search"] = turn_search_record(
             context, None if use_context else answer_prompt)
+        record["similar"] = similar_record(context)
         if KEEP_CONTEXT and (context.turn_search.get("excerpts") or []):
             record["turn_search_excerpts"] = kept_excerpts(store, context.turn_search)
         if KEEP_CONTEXT and KEEP_EVIDENCE_TOKENS:
@@ -2450,25 +2470,29 @@ def run_benchmark(conversations: list[Conversation], *, dataset: str, mode: str 
 
 def turn_search_settings(store: MemoryStore) -> dict[str, Any]:
     """The store's turn search settings, as a results file keeps them: on
-    or off, its three triggers' bars, the keep bar and its tokens."""
+    or off, its three triggers' bars, the keep bar and its tokens, and how
+    many turns most similar to the question are shown (``similar``)."""
     cfg = store.config.retrieval
     return {"on": cfg.turn_search, "bar": cfg.turn_search_bar,
             "several": cfg.turn_search_several, "complete": cfg.turn_search_complete,
-            "keep": cfg.turn_search_keep, "tokens": cfg.turn_search_tokens}
+            "keep": cfg.turn_search_keep, "tokens": cfg.turn_search_tokens,
+            "similar": cfg.similar_turns}
 
 
 def turn_search_text(settings: Any) -> str:
     """Turn search settings as a line of the printed metadata reads them:
     "on (bar 0.8, several 0.5, complete 0.7)", "off", or each store's when
-    they differ."""
+    they differ, then the similar turns shown ("; similar turns 10") when
+    there are any."""
     if isinstance(settings, list):
         return "; ".join(turn_search_text(each) for each in settings)
     if not isinstance(settings, dict):
         return str(settings)
+    similar = f"; similar turns {settings['similar']}" if settings.get("similar") else ""
     if not settings.get("on"):
-        return "off"
+        return "off" + similar
     return (f"on (bar {settings.get('bar')}, several {settings.get('several')}, "
-            f"complete {settings.get('complete')})")
+            f"complete {settings.get('complete')})" + similar)
 
 
 def merge_results(parts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2996,6 +3020,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--context-tokens", type=int, default=None, metavar="N",
                         help=f"the budget of each answer's context (default {CONTEXT_TOKENS}); "
                              "1200 is what an agent gets through MCP by default")
+    parser.add_argument("--similar-turns", type=int, default=None, metavar="N",
+                        help="show up to N turns most similar to each question "
+                             "(MEMRY_SIMILAR_TURNS; the store's default otherwise); 0 shows none")
     parser.add_argument("--contexts-only", action="store_true",
                         help="build and keep every answer's context (implies --keep-context), "
                              "with turn search, but make no answering or judging call")
@@ -3260,6 +3287,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.coverage_audit:
         # no agent reads the second pass's warning here; worker processes inherit this
         os.environ["MEMRY_COVERAGE_AUDIT"] = "0"
+    if args.similar_turns is not None:
+        # every store reads it from the environment, worker processes included
+        os.environ["MEMRY_SIMILAR_TURNS"] = str(args.similar_turns)
     started = time.time()
     try:
         prices = load_prices(args.prices)

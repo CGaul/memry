@@ -258,6 +258,14 @@ class RetrievalConfig(BaseModel):
     #: number, or 0 or off for None).
     turn_search_several: float | None = 0.5
     turn_search_complete: float | None = 0.7
+    #: The turns most similar to the question (``MemoryStore.similar_turns``):
+    #: up to this many passages said in the scope searched, found by their
+    #: words and their vectors as turn search finds its turns, but on every
+    #: search and with no judge. They are shown with turn search's turns, each
+    #: while it fits what the memories and the other turns leave of the
+    #: context, so they never push a memory out. 0, the default, shows none
+    #: (``MEMRY_SIMILAR_TURNS``; the benchmark runner's ``--similar-turns``).
+    similar_turns: int = 0
 
     @field_validator("relational_mode", "relational_fusion", mode="before")
     @classmethod
@@ -583,6 +591,7 @@ def _from_env() -> dict[str, Any]:
     put("retrieval", "turn_search", _bool(e("MEMRY_TURN_SEARCH")))
     put_bar("retrieval", "turn_search_several", e("MEMRY_TURN_SEARCH_SEVERAL"))
     put_bar("retrieval", "turn_search_complete", e("MEMRY_TURN_SEARCH_COMPLETE"))
+    put("retrieval", "similar_turns", _int(e("MEMRY_SIMILAR_TURNS")))
 
     put("embedding", "provider", e("MEMRY_EMBEDDING_PROVIDER"))
     put("embedding", "model", e("MEMRY_EMBEDDING_MODEL"))

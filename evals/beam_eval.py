@@ -212,9 +212,10 @@ answer_messages.context_of = context_of  # type: ignore[attr-defined]
 #: each of its ten abilities asks of a memory (abstention, contradiction
 #: resolution, event ordering, information extraction, instruction following,
 #: knowledge update, multi-session reasoning, preference following,
-#: summarization, temporal reasoning). Written from that list alone, before
-#: any answer to it was read; nothing in it comes from BEAM's questions or
-#: rubrics.
+#: summarization, temporal reasoning). Written from that list after the first
+#: trial, when a few of BEAM's questions and rubrics had been seen
+#: (findings/beam-100k-prompts-and-models.md in the PhD repository). The text
+#: a model reads never names BEAM.
 ABILITIES_SYSTEM = """You are a personal assistant with a long-term memory of your \
 past conversations with this user. Below the user's message is what your memory \
 returned for it: memories with the date each was said, and quoted parts of the \
@@ -230,7 +231,7 @@ and ask which one is correct.
 should answer (format, style, length, tools, level of detail), even when this \
 message does not repeat them.
 - When asked in what order things happened or were discussed, list them in that \
-order, one per line.
+order.
 - When asked for a summary, cover the main points across all the conversations \
 in the context.
 - For questions about time, work out the dates and durations from the dates in \

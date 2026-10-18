@@ -1916,3 +1916,21 @@ def test_the_cli_takes_the_new_options():
     assert args.contexts_only and args.all_members is False
     assert args.keep_evidence_tokens == [1200, 2400]
     assert xb.parse_args(["--dataset", "beam"]).all_members is True
+
+
+def test_kept_excerpts_rebuild_the_turns_shown_at_any_budget(monkeypatch):
+    """Every excerpt turn search judged is kept with its score, its tokens and
+    its lines. Rebuilt at the store's own budget (``beam_eval`` context
+    "turns:N"), the lines are those the answer was shown; a budget too small
+    for any excerpt shows the bare lines."""
+    from evals import beam_eval
+
+    monkeypatch.setattr(xb, "KEEP_CONTEXT", True)
+    row, _, _, _, _, _ = _talk_run(ScriptedJudge(facts=0.2))
+    answer = row["answers"]["3"]
+    row["answer_k"] = answer["k"]
+    kept = answer["turn_search_excerpts"]
+    assert kept and all({"score", "tokens", "turns"} <= set(item) for item in kept)
+    budget = Config().retrieval.turn_search_tokens
+    assert beam_eval.context_lines_of(row, f"turns:{budget}") == answer["context_lines"]
+    assert beam_eval.context_lines_of(row, "turns:1") == answer["context_lines_bare"]

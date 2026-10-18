@@ -46,6 +46,7 @@ so does this one unless --judge-model says otherwise.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hashlib
 import json
 import os
@@ -381,6 +382,50 @@ def openai_chat(model: str, provider: str = "openai") -> Chat:
     return chat
 
 
+#: The question a judge call is made for, so a ``FileJudge`` files it under it.
+ASKED_FOR: contextvars.ContextVar[str] = contextvars.ContextVar("asked_for", default="")
+
+
+def judge_key(messages: list[dict[str, str]]) -> str:
+    """A judge call's key: the hash of its messages, so the same call made again,
+    for another arm or another pass, has the same reply."""
+    text = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
+
+
+class FileJudge:
+    """A judge whose replies are written outside this process (--judge-files),
+    such as by a model with no API key. A call whose key (``judge_key``) is in
+    ``replies`` gets that reply. Any other call gets an empty reply and is kept
+    in ``asked`` (question -> key -> messages), to be answered before grading
+    again. An empty reply has no score and calls no two lines the same event, so
+    the first pass asks every rubric item and every pair an event-ordering answer
+    can need."""
+
+    def __init__(self, replies: dict[str, str]) -> None:
+        self.replies = replies
+        self.asked: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(dict)
+        self._lock = threading.Lock()
+
+    def __call__(self, messages: list[dict[str, str]]) -> tuple[str, dict[str, Any] | None]:
+        key = judge_key(messages)
+        if key in self.replies:
+            return self.replies[key], None
+        with self._lock:
+            self.asked[ASKED_FOR.get()][key] = messages
+        return "", None
+
+
+def read_replies(folder: pathlib.Path) -> dict[str, str]:
+    """Every reply in <folder>/replies/*.json (key -> reply text)."""
+    replies: dict[str, str] = {}
+    for file in sorted((folder / "replies").glob("*.json")):
+        data = json.loads(file.read_text(encoding="utf-8"))
+        replies.update({str(k): v if isinstance(v, str) else json.dumps(v)
+                        for k, v in data.items()})
+    return replies
+
+
 def judge_item(chat: Chat, budget: Budget, item: str, response: str) -> dict[str, Any]:
     prompt = JUDGE_PROMPT.replace("<rubric_item>", item).replace("<llm_response>", response)
     for attempt in range(2):
@@ -546,6 +591,7 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
         row, variant, prediction = task
         if stopped:
             return
+        ASKED_FOR.set(row["qid"])
         try:
             result = grade_answer(chat, budget, row["beam_ability"], row["rubric"], prediction)
         except CapReached as exc:
@@ -559,6 +605,11 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
     started = time.time()
     with ThreadPoolExecutor(max(1, workers)) as pool:
         list(pool.map(one, todo))
+    asked = getattr(chat, "asked", None)
+    if asked:
+        # a file judge without every reply: nothing is graded until they are written
+        return {"judge_model": judge_model, "complete": False, "asked": dict(asked),
+                "stopped": f"{sum(map(len, asked.values()))} judge calls need replies"}
     graded = sorted(done.values(), key=lambda g: (g["qid"], g["variant"]))
     failed = sorted(f"{row['qid']} {variant}" for row in rows
                     for variant, _ in answers_of(row, failed=True))
@@ -580,8 +631,14 @@ def grade(paths: list[str], out: pathlib.Path, *, judge_model: str = JUDGE_MODEL
 #: what the answer was shown, turn search's turns included; "bare": the same
 #: memories and evidence without turn search's turns (the lines shown when it
 #: added none); "evidence:N": the same memories with the evidence turns chosen
-#: within N tokens (the harness's --keep-evidence-tokens N), no turn search.
-CONTEXTS = ("full", "bare", "evidence:N")
+#: within N tokens (the harness's --keep-evidence-tokens N), no turn search;
+#: "turns:N": the bare lines, then the turns of the excerpts turn search judged
+#: at least ``TURN_KEEP``, the best first, while they fit N tokens (rebuilt from
+#: the judged excerpts the harness keeps; the memories stay those of "bare").
+CONTEXTS = ("full", "bare", "evidence:N", "turns:N")
+
+#: The judged score at which turn search shows an excerpt (``retrieval.turn_search_keep``).
+TURN_KEEP = 0.5
 
 
 def context_lines_of(row: dict[str, Any], variant: str = "full") -> list[str] | None:
@@ -600,6 +657,17 @@ def context_lines_of(row: dict[str, Any], variant: str = "full") -> list[str] | 
         lines = answer.get("context_lines")
     elif variant == "bare":
         lines = answer.get("context_lines_bare") or answer.get("context_lines")
+    elif variant.startswith("turns:"):
+        # the bare lines, then turn search's turns as a budget of N tokens shows them
+        from memry.store import fill_excerpts
+
+        excerpts = answer.get("turn_search_excerpts") or []
+        bare = answer.get("context_lines_bare") or answer.get("context_lines")
+        if bare is None:
+            return None
+        chosen = fill_excerpts(excerpts, int(variant.split(":", 1)[1]), TURN_KEEP)
+        shown = sorted({tuple(turn) for i in chosen for turn in excerpts[i]["turns"]})
+        lines = list(bare) + [line for _, line in shown]
     elif variant.startswith("evidence:"):
         lines = (answer.get("context_lines_evidence") or {}).get(variant.split(":", 1)[1])
     else:
@@ -716,6 +784,11 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--max-dollars", type=float, default=None,
                    help="stop once the judge calls have cost more than this many dollars")
     g.add_argument("--workers", type=int, default=8)
+    g.add_argument("--judge-files", default=None, metavar="DIR",
+                   help="judge from replies written to DIR/replies/*.json (key -> reply) "
+                        "instead of calling a model; the calls still needing replies are "
+                        "written to DIR/asked.json, grouped by question, and nothing is "
+                        "graded until every call has its reply")
     args = parser.parse_args(argv)
     if args.command == "fetch":
         root = os.environ.get("MEMRY_BENCH_DATA", "").strip()
@@ -732,8 +805,18 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({k: result[k] for k in ("complete", "stopped", "failed", "calls",
                                                  "tokens", "dollars", "seconds")}))
         return 3 if result["stopped"] else 0
+    chat: Chat | None = None
+    if args.judge_files:
+        folder = pathlib.Path(args.judge_files)
+        chat = FileJudge(read_replies(folder))
     result = grade(args.results, pathlib.Path(args.out), judge_model=args.judge_model,
-                   max_dollars=args.max_dollars, workers=args.workers)
+                   max_dollars=args.max_dollars, workers=args.workers, chat=chat)
+    if result.get("asked") is not None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "asked.json").write_text(json.dumps(result["asked"], ensure_ascii=False),
+                                           encoding="utf-8")
+        print(f"{result['stopped']}: written to {folder / 'asked.json'}", file=sys.stderr)
+        return 4
     print(markdown(result))
     if result["stopped"]:
         print(f"stopped: {result['stopped']}", file=sys.stderr)

@@ -256,7 +256,7 @@ from memry.intelligence.graph_retrieval import (  # noqa: E402
     SET_RESULT_CAP,
     detect_query_entities,
 )
-from memry.models import Memory, Scope  # noqa: E402
+from memry.models import EvidenceTurn, Memory, Scope  # noqa: E402
 from memry.providers.decisions import (  # noqa: E402
     Decider,
     JevDecider,
@@ -1515,6 +1515,26 @@ def turn_search_record(context: AgentContext,
             "budget_tokens": sum(estimate_tokens(turn_line(t)) + 1 for t in context.excerpts)}
 
 
+def kept_excerpts(store: MemoryStore, note: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every excerpt turn search judged for a context (``note``: the context's
+    ``turn_search``), whether shown or not: its judged ``score``, its
+    ``tokens`` as the budget counts them, and the lines of its turns not already
+    shown, each with its place in the order said (``turns``: [place, line]).
+    With these, the turns shown at any other budget or keep can be rebuilt
+    without asking the judge again (``evals.beam_eval``, context "turns:N")."""
+    excerpts = note.get("excerpts") or []
+    ids = list(dict.fromkeys(e for item in excerpts for e in item.get("new_ids") or []))
+    said = store.backend.turn_search_episodes(ids)
+    place = {episode.id: i for i, episode in enumerate(said)}
+    line = {episode.id: turn_line(EvidenceTurn(episode_id=episode.id, content=episode.content,
+                                               speaker=episode.speaker,
+                                               said_at=episode.created_at))
+            for episode in said}
+    return [{"score": item.get("score"), "tokens": item.get("tokens"),
+             "turns": [[place[e], line[e]] for e in item.get("new_ids") or [] if e in line]}
+            for item in excerpts]
+
+
 def answer_with(answer_llm: LLM, question: Question, context: AgentContext,
                 answer_prompt: AnswerPrompt | None) -> dict[str, Any]:
     """One answering call from what Memry gives an agent for the question
@@ -1749,6 +1769,8 @@ def ask(ingested: Ingested, question: Question, *, k: int = 10, answer_llm: LLM 
                                    for t in context.excerpts]
         record["turn_search"] = turn_search_record(
             context, None if use_context else answer_prompt)
+        if KEEP_CONTEXT and (context.turn_search.get("excerpts") or []):
+            record["turn_search_excerpts"] = kept_excerpts(store, context.turn_search)
         if KEEP_CONTEXT and KEEP_EVIDENCE_TOKENS:
             shown = [r.memory for r in context.results]
             record["context_lines_evidence"] = {

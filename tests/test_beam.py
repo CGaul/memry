@@ -257,6 +257,26 @@ def test_grade_stops_at_the_cap_and_keeps_what_it_graded(tmp_path):
     assert 1 <= len(result["graded"]) < 5
 
 
+def test_judge_files_keep_the_calls_of_every_results_file_until_replied(tmp_path):
+    def rows(qid, prediction):
+        return [{"conversation": "beam-7", "qid": qid, "beam_ability": "summarization",
+                 "rubric": ["has budget"], "prediction": prediction}]
+    first = results_file(tmp_path / "a.json", rows("beam-7/summarization/0", "budget"))
+    second = results_file(tmp_path / "b.json", rows("beam-7/summarization/1", "login"))
+    folder = tmp_path / "judge"
+    args = ["--out", str(tmp_path / "s.json"), "--judge-files", str(folder)]
+    assert be.main(["grade", str(first), *args]) == 4
+    assert be.main(["grade", str(second), *args]) == 4
+    asked = json.loads((folder / "asked.json").read_text())
+    assert sorted(asked) == ["beam-7/summarization/0", "beam-7/summarization/1"]
+    key = next(iter(asked["beam-7/summarization/0"]))
+    (folder / "replies").mkdir()
+    (folder / "replies" / "x.json").write_text(json.dumps({key: {"score": 1.0, "reason": "ok"}}))
+    assert be.main(["grade", str(second), *args]) == 4
+    assert sorted(json.loads((folder / "asked.json").read_text())) == ["beam-7/summarization/1"]
+    assert be.main(["grade", str(first), *args]) == 0
+
+
 def test_fetch_pages_and_refuses_shortened_cells(tmp_path):
     pages = []
 

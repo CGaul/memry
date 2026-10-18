@@ -812,9 +812,17 @@ def main(argv: list[str] | None = None) -> int:
     result = grade(args.results, pathlib.Path(args.out), judge_model=args.judge_model,
                    max_dollars=args.max_dollars, workers=args.workers, chat=chat)
     if result.get("asked") is not None:
+        # added to the calls other results files still need, those answered since left out
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "asked.json").write_text(json.dumps(result["asked"], ensure_ascii=False),
-                                           encoding="utf-8")
+        path = folder / "asked.json"
+        asked = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        for qid, calls in result["asked"].items():
+            asked.setdefault(qid, {}).update(calls)
+        replied = read_replies(folder)
+        asked = {qid: {k: m for k, m in calls.items() if k not in replied}
+                 for qid, calls in asked.items()}
+        path.write_text(json.dumps({q: c for q, c in asked.items() if c}, ensure_ascii=False),
+                        encoding="utf-8")
         print(f"{result['stopped']}: written to {folder / 'asked.json'}", file=sys.stderr)
         return 4
     print(markdown(result))

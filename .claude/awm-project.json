@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-19T13:31:31+00:00",
+  "generator": "awm-setup:setup-awm-project (templates/project-setup, manifest schema_version 1)",
+  "repo": {
+    "gh_slug": "CGaul/memry",
+    "default_branch": "main",
+    "display_name": "memry",
+    "root": "/Users/costa/Development/memry"
+  },
+  "stack": {
+    "languages": [
+      "python"
+    ],
+    "package_manager": "pip",
+    "runtime_version": "python>=3.11 (CI 3.12; .venv 3.12.14)",
+    "monorepo": {
+      "enabled": false,
+      "packages": [
+        "src/memry"
+      ]
+    }
+  },
+  "commands": {
+    "install": "python -m pip install -e \".[dev]\"",
+    "typecheck": null,
+    "lint": null,
+    "test_unit": "python -m pytest -q",
+    "test_integration": null,
+    "coverage": null,
+    "full_gate": "python -m pytest -q && python deploy/release_check.py",
+    "build": "python -m build",
+    "run": "./run.sh",
+    "verified": [
+      {
+        "cmd": "python -m pytest -q",
+        "exit_code": 0,
+        "note": "~40 s; 7 skipped (usearch, nltk, MEMRY_BENCH_DATA absent; CI installs only .[dev] and skips the same)"
+      },
+      {
+        "cmd": "python deploy/release_check.py",
+        "exit_code": 0,
+        "note": "on main @ e5900d0: v0.2.50 already released, release=false"
+      },
+      {
+        "cmd": "python -m memry.cli --help",
+        "exit_code": 0
+      }
+    ]
+  },
+  "layout": {
+    "source_roots": [
+      "src/memry"
+    ],
+    "test_roots": [
+      "tests"
+    ],
+    "onion": {},
+    "layer_map_rules": []
+  },
+  "capabilities": {
+    "http_api": {
+      "enabled": true,
+      "framework": "starlette",
+      "entry": "src/memry/rest.py",
+      "openapi": null
+    },
+    "frontend": {
+      "enabled": false,
+      "note": "dashboard is inline HTML/JS in src/memry/rest.py"
+    },
+    "storybook": {
+      "enabled": false
+    },
+    "tenants": {
+      "enabled": false,
+      "note": "MEMRY_TENANTS/accounts are runtime namespaces of one server, not deployment targets"
+    },
+    "harness": {
+      "enabled": false
+    },
+    "ci": {
+      "enabled": true,
+      "workflows": [
+        ".github/workflows/publish.yml",
+        ".github/workflows/pypi-canary.yml"
+      ]
+    },
+    "notion": {
+      "enabled": false
+    },
+    "release": {
+      "enabled": false,
+      "note": "memry releases via its own CI: a new __version__ pushed to main is tagged and published"
+    },
+    "run_app": {
+      "enabled": true,
+      "cmd": "memry serve",
+      "ports": [
+        8787
+      ]
+    },
+    "migrations": {
+      "enabled": true,
+      "where": [
+        "src/memry/backends/local.py",
+        "src/memry/accounts.py"
+      ]
+    }
+  },
+  "graphify": {
+    "enabled": true,
+    "corpus_scope": "source + docs (src/, evals/*.py, deploy/, docs/, README.md); tests and data excluded",
+    "ignore_globs": [
+      "tests/",
+      "evals/datasets/",
+      ".venv/",
+      "venv/",
+      "__pycache__/",
+      ".pytest_cache/",
+      "build/",
+      "dist/",
+      "*.egg-info/",
+      "memry_emb_cache/",
+      ".memry/",
+      "*.db",
+      "*.db-wal",
+      "*.db-shm",
+      "*.usearch",
+      "*.usearch.json",
+      "*.jsonl",
+      ".gh-work/",
+      ".harness/",
+      ".lineage/",
+      "website/",
+      "LICENSE"
+    ],
+    "post_clustering": false,
+    "extraction_run": false,
+    "hooks_installed": false
+  },
+  "flags": {
+    "HTTP_API": true,
+    "FRONTEND": false,
+    "STORYBOOK": false,
+    "TENANTS": false,
+    "HARNESS": false,
+    "RELEASE": false,
+    "NOTION": false,
+    "GRAPHIFY": true,
+    "LAYERED": false,
+    "TYPECHECK": false,
+    "TESTS": true,
+    "MONOREPO": false,
+    "CI": true,
+    "RUN_APP": true,
+    "MIGRATIONS": true
+  },
+  "vars": {
+    "GH_REPO": "CGaul/memry",
+    "PROJECT_NAME": "memry",
+    "PROJECT_DESCRIPTION": "Memry is an open, self-hostable memory layer for AI agents: MCP-native,\nlocal-first, published to PyPI as `memry`. One Python package\n(`src/memry`) serves a Python API, the `memry` CLI, a REST API with an\ninline dashboard, and MCP (stdio and streamable HTTP), all over one\nSQLite store. `docs/architecture.md` is the detailed design record;\n`README.md` is the user-facing reference.\n\nAWM workflows file issues and PRs against the fork `CGaul/memry`\n(`origin`); PRs to upstream `cosmin-novac/memry` are opened by hand.",
+    "STACK_SUMMARY": "a single Python package (`src/memry`, Python ≥3.11, built with hatchling) that serves a CLI, a REST API with an inline dashboard, and MCP over Starlette/uvicorn, with SQLite as its only production store",
+    "GATE_SUMMARY": "The gates are the two CI jobs in `.github/workflows/publish.yml`: `python -m pytest -q` (the suite in `tests/`, about 40 s, which also parses the inline dashboard JS with `node --check`) and `python deploy/release_check.py` (release drift: any change under `src/memry`, `pyproject.toml`, `Dockerfile` or `requirements-docker.txt` needs a new `__version__` in `src/memry/__init__.py`, so such a change bumps the patch version, as every merged PR here does). There is no typecheck or lint gate.",
+    "GATE_NAMES": "`python -m pytest -q` and `python deploy/release_check.py`",
+    "TEST_CMD": "python -m pytest -q",
+    "BUILD_CMD": "python -m build",
+    "COMMANDS_BLOCK": ". .venv/bin/activate                         # the project venv (Python 3.12)\npython -m pip install -e \".[dev]\"            # install, as CI does\npython -m pytest -q                          # gate 1: the test suite (CI job \"test\")\npython deploy/release_check.py               # gate 2: release drift (CI job \"check\")\ngit config core.hooksPath deploy/git-hooks   # once per clone: run gate 2 on pre-push\nmemry serve --host 127.0.0.1 --port 8787     # REST + dashboard + /mcp; needs a text and a decision model\n./run.sh --port-offset 100                   # isolated instance for review (scratch DB under .memry/)",
+    "SOURCE_ROOTS": "`src/memry/` (its top-level modules plus `backends/`, `intelligence/`, `providers/` and `evals/`)",
+    "LAYERING_RULE": "imports point inward only: surfaces (`cli.py`, `rest.py`, `mcp_server.py`) → `store.py` → `intelligence/`, `retrieval.py`, `filters.py` → `providers/`, `backends/`, with `models.py` and `config.py` shared; surfaces call `MemoryStore` instead of implementing memory behaviour",
+    "LAYERING_PROSE_MD": "`docs/architecture.md` §2 defines the layers. From the outside in:\n\n| Layer | Where | Rule |\n|---|---|---|\n| Public surfaces | `cli.py`, `rest.py` (REST API, inline dashboard, `/mcp` mount), `mcp_server.py`, `enrichment.py` | Call `MemoryStore`; never implement memory behaviour themselves. |\n| Facade | `store.py` (`MemoryStore`) | Ownership checks and the read/write workflows; the main invariant boundary. |\n| Intelligence + retrieval | `intelligence/`, `retrieval.py`, `filters.py` | Derived outputs stay rebuildable from evidence; nothing forgets a memory for its age. |\n| Providers | `providers/` (text LLMs, embeddings, the decision model) | Optional; the zero-key fallbacks (`NoneLLM`, `HashEmbedder`) keep working. |\n| Persistence | `backends/` (`LocalBackend` on SQLite; `mem0_adapter.py` is comparison/import only) | SQLite is the only production source of truth. |\n| Shared | `models.py`, `config.py` | Imported by every layer; they import nothing from the layers. |\n\nImports point inward only: surfaces → `store.py` → intelligence/retrieval →\nproviders and backends. Accounts and auth (`accounts.py`, `oauth.py`,\n`principal.py`) sit beside the surfaces and keep login data in their own\nSQLite file.\n\nStanding exceptions visible today (they move as refactors land, so measure\nagainst the current code rather than this list):\n- `cli.py`, `rest.py` and `mcp_server.py` import from `intelligence/`\n  (`when`, `context`, `split`) and `filters.py` directly, for request and date\n  parsing, instead of going through `MemoryStore`.\n- `providers/decisions.py` imports `intelligence.extraction.parse_lenient_json`\n  (a function-level import, provider → intelligence).\n\nThe dashboard is one inline HTML/JS string in `rest.py`;\n`tests/test_dashboard_js.py` parses it with `node --check`, so a stray brace\nfails the suite. The version lives only in `src/memry/__init__.py`, and a push\nto `main` with a new version is a release: CI tags it, publishes to PyPI and\ncreates the GitHub release. `tests/test_container_build.py` keeps\n`requirements-docker.txt` in sync with `pyproject.toml`.",
+    "MIGRATION_NOTE": "additive `ALTER TABLE … ADD COLUMN` steps that run when the database opens, each guarded by a `PRAGMA table_info` check: `LocalBackend` in `backends/local.py`, and `accounts.py` for the login database; there is no migrations directory and no schema version",
+    "TENANT_VALUE": "all",
+    "CONTRACT_PROBES_MD": "   Run with the project venv active (`. .venv/bin/activate`); every command\n   below is read-only, builds its store in `:memory:`, and has run green twice\n   with identical output.\n\n   - **REST + dashboard routes** (path and methods):\n     `python -c \"from memry.config import Config; from memry.store import MemoryStore; from memry.providers.llm import NoneLLM; from memry.providers.embeddings import HashEmbedder; from memry.rest import create_app; app = create_app(MemoryStore(Config(db_path=':memory:'), llm=NoneLLM(), embedder=HashEmbedder(64))); print(*sorted(getattr(r, 'path', '?') + ' ' + ','.join(sorted(getattr(r, 'methods', None) or ['*'])) for r in app.routes), sep='\\n')\"`\n   - **MCP tool names**:\n     `python -c \"import asyncio; from memry.config import Config; from memry.store import MemoryStore; from memry.providers.llm import NoneLLM; from memry.providers.embeddings import HashEmbedder; from memry.mcp_server import create_server; s = create_server(MemoryStore(Config(db_path=':memory:'), llm=NoneLLM(), embedder=HashEmbedder(64))); print(*sorted(t.name for t in asyncio.run(s.list_tools())), sep='\\n')\"`\n   - **SQLite schema** (every table, index and trigger a fresh store creates):\n     `python -c \"from memry.config import Config; from memry.store import MemoryStore; from memry.providers.llm import NoneLLM; from memry.providers.embeddings import HashEmbedder; db = MemoryStore(Config(db_path=':memory:'), llm=NoneLLM(), embedder=HashEmbedder(64)).backend._db; print(*(r[0] for r in db.execute('SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name')), sep='\\n')\"`\n   - **`MemoryStore` public API** (method names with signatures):\n     `python -c \"import inspect; from memry.store import MemoryStore; print(*sorted(n + str(inspect.signature(f)) for n, f in inspect.getmembers(MemoryStore, inspect.isfunction) if not n.startswith('_')), sep='\\n')\"`\n   - **CLI surface**: `python -m memry.cli --help` (add `<subcommand> --help`\n     for each subcommand the refactor touches)\n   - **Configuration keys**: `grep -ho \"MEMRY_[A-Z_]*[A-Z]\" src/memry/*.py | sort -u`",
+    "RUN_CMD": "\"$PY\" -m memry.cli serve --host 127.0.0.1 --port \"$PORT\"",
+    "DEFAULT_FRONTEND_PORT": "8787",
+    "DEFAULT_BACKEND_PORT": "8787",
+    "RUN_ENV_EXPORTS": "# One uvicorn process serves the dashboard, the REST API and /mcp on a single\n# port, so both port settings name the same socket: an explicit\n# --frontend-port wins (it is what AWM opens), else --backend-port, else the\n# offset default.\nif [ \"$FRONTEND_PORT\" = \"$((DEFAULT_FRONTEND_PORT + OFFSET))\" ]; then\n  FRONTEND_PORT=\"$BACKEND_PORT\"\nfi\nPORT=\"$FRONTEND_PORT\"\nBACKEND_PORT=\"$PORT\"\n\n# A branch worktree has neither .env nor .venv: fall back to the main checkout's.\nMAIN_ROOT=\"$(dirname \"$(git rev-parse --path-format=absolute --git-common-dir)\")\"\nfor ENV_FILE in .env \"$MAIN_ROOT/.env\"; do\n  if [ -f \"$ENV_FILE\" ]; then set -a; . \"$ENV_FILE\"; set +a; break; fi\ndone\nPY=.venv/bin/python\n[ -x \"$PY\" ] || PY=\"$MAIN_ROOT/.venv/bin/python\"\n[ -x \"$PY\" ] || PY=\"$(command -v python3)\"\n\n# Isolated state per port: never the developer's ~/.memry database or config,\n# and no nightly snapshot. The login database lands beside memry.db.\nRUN_DIR=\"$PWD/.memry/run-$PORT\"\nmkdir -p \"$RUN_DIR\"\nexport MEMRY_DB_PATH=\"$RUN_DIR/memry.db\"\nexport MEMRY_CONFIG=\"$RUN_DIR/config.json\"\nunset MEMRY_AUTH_DB_PATH MEMRY_SNAPSHOT_DIR\n# This checkout's source wins over the editable install the venv points at.\nexport PYTHONPATH=\"$PWD/src${PYTHONPATH:+:$PYTHONPATH}\"",
+    "RUN_URL_LINES": "echo \"[awm] url api=http://localhost:$PORT/api/v1\"\necho \"[awm] url mcp=http://localhost:$PORT/mcp\"",
+    "GRAPHIFY_IGNORE_LINES": "# tests and their data\ntests/\nevals/datasets/\n\n# environments, caches, build output\n.venv/\nvenv/\n__pycache__/\n.pytest_cache/\nbuild/\ndist/\n*.egg-info/\nmemry_emb_cache/\n\n# runtime state and data files\n.memry/\n*.db\n*.db-wal\n*.db-shm\n*.usearch\n*.usearch.json\n*.jsonl\n\n# AWM runtime artifacts\n.gh-work/\n.harness/\n.lineage/\n\n# the marketing site and the licence carry no architectural signal\nwebsite/\nLICENSE"
+  },
+  "known_issues": [
+    {
+      "where": "deploy/git-hooks/pre-push",
+      "issue": "core.hooksPath is unset in this clone, so the release-drift check runs only in CI",
+      "action": "git config core.hooksPath deploy/git-hooks (left to the user)"
+    },
+    {
+      "where": "tests/",
+      "issue": "7 tests skip locally (usearch, nltk, MEMRY_BENCH_DATA); CI installs only .[dev] and skips the same",
+      "action": "none"
+    },
+    {
+      "where": "tests/test_about.py:7",
+      "issue": "StarletteDeprecationWarning: install httpx2 instead of httpx for starlette.testclient",
+      "action": "report only"
+    },
+    {
+      "where": "AWM templates/project-setup",
+      "issue": "AWM lists /finalize-workflow as missing but the template set has no finalize-workflow template",
+      "action": "report to AWM; not installable from here"
+    },
+    {
+      "where": "AWM templates/project-setup/files/skills/release-qa",
+      "issue": "release-qa prose is AWM-specific (ci.yml, AWM_HOME, React router grep); not rendered here because RELEASE=false",
+      "action": "report to AWM"
+    },
+    {
+      "where": "branch naming",
+      "issue": "the repo's own branches use feat/, fix/, hotfix/; AWM workflows use feature/, bugfix/, refactor/",
+      "action": "none"
+    }
+  ],
+  "decisions": [
+    {
+      "question": "Which repo do issues and PRs go to?",
+      "answer": "CGaul/memry (fork, origin); upstream PRs to cosmin-novac/memry are opened by hand",
+      "source": "user"
+    },
+    {
+      "question": "Multi-tenant?",
+      "answer": "no; Tenant: all",
+      "source": "user"
+    },
+    {
+      "question": "AWM release flow?",
+      "answer": "no; memry releases via its own CI on a version bump",
+      "source": "user"
+    },
+    {
+      "question": "Notion outcome database?",
+      "answer": "no",
+      "source": "user"
+    },
+    {
+      "question": "Layered graphify post-clustering?",
+      "answer": "no; no onion-style layer directories exist",
+      "source": "detected"
+    }
+  ]
+}

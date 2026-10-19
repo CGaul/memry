@@ -43,3 +43,27 @@ evals/cost_measure*.json
 evals/cost_scaling.json
 *.usearch
 *.usearch.json
+
+# AI Workflow Manager — runtime artifacts (never committed)
+.gh-work/
+.harness/
+.lineage/
+.mcp.json
+
+# graphify: the graph is a build artifact — we commit the inputs, not the output.
+# Rebuild locally with `graphify . --update` (replays the committed semantic
+# cache for free; re-derives the AST, which needs no LLM).
+graphify-out/graph.json
+graphify-out/graph.html
+graphify-out/graph.svg
+graphify-out/graph.graphml
+graphify-out/cypher.txt
+graphify-out/cost.json
+graphify-out/cache/ast/
+graphify-out/cache/stat-index.json
+graphify-out/cache/last_query_stamp
+graphify-out/.graphify_*
+graphify-out/.chunklist_*
+graphify-out/obsidian/
+graphify-out/wiki/
+graphify-out/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/

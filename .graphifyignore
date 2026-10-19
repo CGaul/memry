@@ -1,0 +1,47 @@
+# graphify corpus scope: source + docs only.
+#
+# Tests are excluded so the map and query results are not dominated by
+# scaffolding. The cost of that choice: `graphify affected` will never list the
+# tests that exercise a symbol — a blast-radius check must grep the test files
+# separately, because the graph cannot answer "what tests this".
+# tests and their data
+tests/
+evals/datasets/
+
+# environments, caches, build output
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+memry_emb_cache/
+
+# runtime state and data files
+.memry/
+*.db
+*.db-wal
+*.db-shm
+*.usearch
+*.usearch.json
+*.jsonl
+
+# AWM runtime artifacts
+.gh-work/
+.harness/
+.lineage/
+
+# the marketing site and the licence carry no architectural signal
+website/
+LICENSE
+
+# assets carry no architectural signal
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.woff
+*.woff2

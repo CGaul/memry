@@ -1,0 +1,97 @@
+%% C4 (container + component) — memry storage behind dialect adapters.
+%% Flowchart syntax with C4 styling: mermaid's native C4 renderer lays out
+%% boundaries poorly. Solid = exists today, dashed border = new in this design,
+%% dotted = possible later, not part of the first cut.
+flowchart TB
+  classDef person fill:#08427b,stroke:#052e56,color:#fff
+  classDef container fill:#1168bd,stroke:#0b4884,color:#fff
+  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
+  classDef newcomp fill:#85bbf0,stroke:#d9480f,stroke-width:3px,stroke-dasharray:6 3,color:#000
+  classDef later fill:#e9ecef,stroke:#868e96,stroke-dasharray:2 3,color:#495057
+  classDef db fill:#2f6f4f,stroke:#1e4a34,color:#fff
+  classDef newdb fill:#2f6f4f,stroke:#d9480f,stroke-width:3px,stroke-dasharray:6 3,color:#fff
+  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+
+  agents["<b>MCP clients</b><br/>[Person / software]<br/>Claude Code sessions (AWM steps,<br/>manual), claude.ai, Cursor"]:::person
+  ops["<b>Operator</b><br/>[Person]<br/>memry CLI, dashboard"]:::person
+
+  subgraph SERVER["memry serve — one process today; N replicas once storage is shared"]
+    direction TB
+    api["<b>MCP /mcp · REST /api/v1 · dashboard</b><br/>[Starlette]<br/>auth → Principal → namespace"]:::container
+    store["<b>MemoryStore</b><br/>[Python]<br/>write path, reconcile, retrieval,<br/>upkeep — talks only to the ports"]:::container
+    worker["<b>EnrichmentWorker</b><br/>[asyncio task]<br/>drains pending memories"]:::container
+
+    subgraph PORTS["Ports — store-facing contracts"]
+      direction LR
+      pBackend["<b>MemoryBackend</b><br/>[ABC, exists]<br/>episodes, memories, entities,<br/>topics, relations, events"]:::component
+      pAuth["<b>AccountStore</b><br/>[port, extracted]<br/>accounts, keys, OAuth"]:::newcomp
+    end
+
+    subgraph CORE["SqlBackend — the ONE implementation of MemoryBackend (today's LocalBackend logic)"]
+      direction LR
+      sqlcore["<b>SqlBackend</b><br/>[Python]<br/>every query written once,<br/>in the portable SQL subset"]:::newcomp
+      pDialect["<b>Dialect</b><br/>[port]<br/>placeholders, upsert, JSON path<br/>+ array expansion, DDL, migrations"]:::newcomp
+      pText["<b>KeywordIndex</b><br/>[port]<br/>BM25 scores, trigram name lookup"]:::newcomp
+      pVector["<b>VectorIndex</b><br/>[port]<br/>candidates by cosine"]:::newcomp
+      pLock["<b>WriteGuard</b><br/>[port]<br/>serialize writes, claim work"]:::newcomp
+    end
+
+    subgraph SQLITE["SQLite adapters — behaviour identical to today"]
+      direction LR
+      sqDialect["SqliteDialect<br/>json_extract / json_each,<br/>in-code _ensure_* migrations"]:::component
+      sqFts["Fts5Index<br/>native bm25(), fts5 trigram"]:::component
+      sqLock["ProcessLock<br/>threading.RLock + BEGIN"]:::component
+      snap["Snapshot<br/>online backup API"]:::component
+    end
+
+    subgraph PG["PostgreSQL adapters — new"]
+      direction LR
+      pgDialect["PostgresDialect<br/>psycopg 3 + pool, jsonb,<br/>numbered migrations"]:::newcomp
+      pgText["PostingIndex<br/>BM25 over term postings,<br/>unicode61 tokenizer port;<br/>pg_trgm for names"]:::newcomp
+      pgLock["AdvisoryGuard<br/>pg_advisory_xact_lock,<br/>FOR UPDATE SKIP LOCKED claims"]:::newcomp
+    end
+
+    subgraph VEC["Vector adapters"]
+      direction LR
+      numpy["NumpyScan<br/>brute force over BLOB / bytea"]:::component
+      usearch["UsearchSidecar<br/>HNSW file, rebuildable"]:::component
+      pgvector["PgVector<br/>HNSW inside Postgres"]:::later
+    end
+
+    my["MySqlDialect<br/>(possible, not planned)"]:::later
+  end
+
+  sqlitedb[("<b>memry.db + auth.db</b><br/>[SQLite files, WAL]<br/>single writer process")]:::db
+  pgdb[("<b>PostgreSQL</b><br/>[schema memry + memry_auth]<br/>e.g. the AWM hub's instance;<br/>backups via pg_dump / PITR")]:::newdb
+  models["<b>Text / decision / embedding models</b><br/>[external]"]:::ext
+
+  agents -->|"MCP (HTTP or stdio)"| api
+  ops -->|"HTTPS / CLI"| api
+  api --> store
+  worker --> store
+  store --> pBackend
+  api --> pAuth
+  store -->|"extract, decide, embed"| models
+
+  pBackend -->|"implemented by"| sqlcore
+  sqlcore --> pDialect
+  sqlcore --> pText
+  sqlcore --> pVector
+  sqlcore --> pLock
+
+  pDialect -.->|"MEMRY_DB_PATH (default)"| sqDialect
+  pText -.-> sqFts
+  pLock -.-> sqLock
+  pDialect -.->|"MEMRY_DB_URL=postgresql://…"| pgDialect
+  pText -.-> pgText
+  pLock -.-> pgLock
+  pDialect -.-> my
+  pVector -.-> numpy
+  pVector -.-> usearch
+  pVector -.-> pgvector
+
+  sqDialect --> sqlitedb
+  snap --> sqlitedb
+  pAuth -.-> sqlitedb
+  pgDialect --> pgdb
+  pAuth -.-> pgdb

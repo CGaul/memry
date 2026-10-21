@@ -79,3 +79,25 @@ part of this plan.
 ## Migration guide diagrams
 
 Step-by-step C4 component views (flowchart syntax) in [migration/](migration/): `0-today.mmd`, `1-storage-ports.mmd`, `2-portable-keyword-index.mmd`, `3-postgres-optional.mmd`.
+
+## Why not SQLAlchemy (for now)
+
+With two engines, the differences the `Dialect` port must cover are small:
+`IFNULL`→`COALESCE` and `INSERT OR IGNORE`→`ON CONFLICT … DO NOTHING` are
+one-time portable rewrites (SQLite ≥ 3.24 accepts both), and what remains is
+about a dozen helpers — placeholders, JSON access, array expansion, `char()`/
+`chr()`. The parts a query builder cannot abstract (FTS5, the triggers, the
+planner hints in `_keyword_scores`) would stay raw `text()` SQL under SQLAlchemy
+as well; step 2 removes the largest of them without it.
+
+Against adopting it now: step 1 promises no behaviour change, and rewriting
+312 hand-tuned queries as expressions is a large diff that can change query
+plans; memry keeps eight runtime dependencies and talks to providers over plain
+`httpx`; and "same queries, no new dependency" is what makes step 1 easy to
+accept.
+
+Worth revisiting with a third engine (MySQL lacks partial indexes and
+transactional DDL) or for step 3's numbered migrations (Alembic), though plain
+numbered `.sql` files are likely enough. If adopted later, SQLAlchemy Core
+becomes the implementation of the `Dialect` port; nothing that calls
+`SqlBackend` changes.

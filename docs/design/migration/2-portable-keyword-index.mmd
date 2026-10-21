@@ -1,0 +1,39 @@
+---
+config:
+  flowchart:
+    useMaxWidth: false
+    wrappingWidth: 320
+    nodeSpacing: 40
+    rankSpacing: 70
+---
+%% Step 2 (#7): keyword search computed by memry itself, opt-in on SQLite,
+%% proven equal to FTS5 by the parity tests. Dashed orange border = new.
+flowchart LR
+  classDef comp fill:#1168bd,stroke:#0b4884,color:#ffffff
+  classDef port fill:#85bbf0,stroke:#5d82a8,color:#0b1f33
+  classDef newcomp fill:#85bbf0,stroke:#e8590c,stroke-width:3px,stroke-dasharray:6 3,color:#0b1f33
+  classDef adapter fill:#dbe8f6,stroke:#5d82a8,color:#0b1f33
+  classDef db fill:#2f6f4f,stroke:#1e4a34,color:#ffffff
+  classDef newdb fill:#2f6f4f,stroke:#e8590c,stroke-width:3px,stroke-dasharray:6 3,color:#ffffff
+  classDef test fill:#fff4e6,stroke:#e8590c,color:#5c2b06
+
+  sqlb["<b>SqlBackend</b><br/>[Component: Python]<br/>asks for keyword scores"]:::comp
+  kw["<b>KeywordIndex</b><br/>[Port]"]:::port
+
+  fts5["<b>Fts5KeywordIndex</b><br/>[Adapter: SQLite only]<br/>bm25() inside SQLite"]:::adapter
+  post["<b>PostingKeywordIndex</b><br/>[Adapter: any SQL engine]<br/>unicode61 tokenizer ported to Python,<br/>BM25 and MaxScore in Python<br/>MEMRY_KEYWORD_INDEX=portable"]:::newcomp
+
+  subgraph FILE["memry.db · one SQLite file"]
+    direction TB
+    ftsdb[("<b>FTS5 virtual tables</b><br/>memories_fts, episodes_fts")]:::db
+    kwt[("<b>Plain tables</b><br/>kw_docs, kw_postings,<br/>kw_terms, kw_stats")]:::newdb
+  end
+
+  parity["<b>Parity tests</b><br/>both adapters, one corpus:<br/>same terms for all 1.1M code points,<br/>same scores and ranking,<br/>also after updates and deletes"]:::test
+
+  sqlb --> kw
+  kw -.->|"default"| fts5
+  kw -.->|"opt-in"| post
+  fts5 -->|"MATCH, bm25()"| ftsdb
+  post -->|"SELECT, INSERT, DELETE only"| kwt
+  parity -.->|"runs both adapters"| kw

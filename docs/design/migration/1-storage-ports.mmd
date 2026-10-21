@@ -1,0 +1,52 @@
+---
+config:
+  flowchart:
+    useMaxWidth: false
+    wrappingWidth: 320
+    nodeSpacing: 40
+    rankSpacing: 110
+---
+%% Step 1 (#6): one SqlBackend behind four ports; SQLite adapters only.
+%% Dashed orange border = new; everything else exists today and only moves.
+flowchart LR
+  classDef comp fill:#1168bd,stroke:#0b4884,color:#ffffff
+  classDef port fill:#85bbf0,stroke:#5d82a8,color:#0b1f33
+  classDef newcomp fill:#85bbf0,stroke:#e8590c,stroke-width:3px,stroke-dasharray:6 3,color:#0b1f33
+  classDef adapter fill:#dbe8f6,stroke:#5d82a8,color:#0b1f33
+  classDef db fill:#2f6f4f,stroke:#1e4a34,color:#ffffff
+
+  store["<b>MemoryStore</b><br/>[Component: Python]<br/>unchanged"]:::comp
+  backend["<b>MemoryBackend</b><br/>[Port: ABC]<br/>the contract the store<br/>already uses, unchanged"]:::port
+
+  subgraph CORE["SqlBackend · the one implementation"]
+    direction TB
+    sqlb["<b>SqlBackend</b><br/>[Component: Python]<br/>today's LocalBackend logic,<br/>queries in portable SQL"]:::newcomp
+    dialect["<b>Dialect</b><br/>[Port]<br/>placeholders, JSON functions,<br/>DDL, migrations"]:::newcomp
+    kw["<b>KeywordIndex</b><br/>[Port]<br/>keyword scores, word counts,<br/>name lookup"]:::newcomp
+    vec["<b>VectorIndex</b><br/>[Port]<br/>cosine candidates"]:::newcomp
+    guard["<b>WriteGuard</b><br/>[Port]<br/>transactions, write order,<br/>claiming pending work"]:::newcomp
+  end
+
+  subgraph SQLITE["SQLite adapters · moved from LocalBackend, not rewritten"]
+    direction TB
+    sqd["<b>SqliteDialect</b><br/>today's DDL, 16 triggers,<br/>6 in-code migrations"]:::adapter
+    fts5["<b>Fts5KeywordIndex</b><br/>today's bm25() scoring<br/>and trigram name lookup"]:::adapter
+    vecs["<b>NumpyScan, UsearchSidecar</b><br/>today's vector search"]:::adapter
+    lock["<b>ProcessWriteGuard</b><br/>today's RLock + BEGIN"]:::adapter
+  end
+
+  db[("<b>memry.db</b><br/>[SQLite file]<br/>same schema, same file")]:::db
+
+  store -->|"calls"| backend
+  backend -->|"implemented by"| sqlb
+  sqlb --> dialect
+  sqlb --> kw
+  sqlb --> vec
+  sqlb --> guard
+  dialect -.->|"SQLite"| sqd
+  kw -.->|"SQLite"| fts5
+  vec -.->|"any engine"| vecs
+  guard -.->|"SQLite"| lock
+  sqd --> db
+  fts5 --> db
+  vecs --> db

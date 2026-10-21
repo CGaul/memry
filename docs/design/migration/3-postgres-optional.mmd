@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    useMaxWidth: false
+    wrappingWidth: 320
+    nodeSpacing: 40
+    rankSpacing: 70
+---
+%% Step 3 (#8, optional): PostgreSQL as a second set of adapters behind the
+%% same ports. SQLite stays the default. Dashed orange border = new.
+flowchart LR
+  classDef person fill:#08427b,stroke:#052e56,color:#ffffff
+  classDef comp fill:#1168bd,stroke:#0b4884,color:#ffffff
+  classDef newcomp fill:#85bbf0,stroke:#e8590c,stroke-width:3px,stroke-dasharray:6 3,color:#0b1f33
+  classDef adapter fill:#dbe8f6,stroke:#5d82a8,color:#0b1f33
+  classDef db fill:#2f6f4f,stroke:#1e4a34,color:#ffffff
+  classDef newdb fill:#2f6f4f,stroke:#e8590c,stroke-width:3px,stroke-dasharray:6 3,color:#ffffff
+
+  agent["<b>MCP clients</b><br/>[Person]<br/>Claude Code, Cursor,<br/>claude.ai"]:::person
+
+  subgraph REPLICA["memry serve · one or more processes"]
+    direction TB
+    sqlb["<b>SqlBackend</b><br/>[Component: Python]<br/>the same code as on SQLite"]:::comp
+    pgd["<b>PostgresDialect</b><br/>psycopg 3 + pool, jsonb, bytea,<br/>numbered migrations"]:::newcomp
+    post["<b>PostingKeywordIndex</b><br/>from step 2, bulk writes via COPY"]:::adapter
+    adv["<b>AdvisoryWriteGuard</b><br/>pg_advisory_xact_lock,<br/>FOR UPDATE SKIP LOCKED leases"]:::newcomp
+    acc["<b>PgAccountStore</b><br/>accounts, keys, OAuth<br/>shared by every process"]:::newcomp
+  end
+
+  pg[("<b>PostgreSQL</b><br/>[schemas memry, memry_auth]<br/>backups: pg_dump, PITR")]:::newdb
+  sqlite[("<b>memry.db + auth.db</b><br/>[SQLite]<br/>still the default")]:::db
+
+  agent -->|"MCP over HTTP"| sqlb
+  sqlb --> pgd
+  sqlb --> post
+  sqlb --> adv
+  pgd -->|"MEMRY_DB_URL"| pg
+  post --> pg
+  adv --> pg
+  acc --> pg
+  sqlb -.->|"MEMRY_DB_PATH, default"| sqlite

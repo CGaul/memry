@@ -75,3 +75,7 @@ change SQLite's behaviour, so the triggers stay triggers.
 MySQL fits the same ports (`MySqlDialect`), but it lacks partial indexes,
 advisory transaction locks of the same shape, and transactional DDL, so it is not
 part of this plan.
+
+## Migration guide diagrams
+
+Step-by-step C4 component views (flowchart syntax) in [migration/](migration/): `0-today.mmd`, `1-storage-ports.mmd`, `2-portable-keyword-index.mmd`, `3-postgres-optional.mmd`.

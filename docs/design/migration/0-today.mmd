@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    useMaxWidth: false
+    wrappingWidth: 320
+    nodeSpacing: 40
+    rankSpacing: 70
+---
+%% C4 component view in flowchart syntax (mermaid's native C4 renderer draws
+%% arrows through boundary titles). Orange border = behaviour that lives in
+%% the database itself.
+flowchart LR
+  classDef person fill:#08427b,stroke:#052e56,color:#ffffff
+  classDef comp fill:#1168bd,stroke:#0b4884,color:#ffffff
+  classDef db fill:#2f6f4f,stroke:#1e4a34,color:#ffffff
+  classDef dblogic fill:#2f6f4f,stroke:#e8590c,stroke-width:3px,color:#ffffff
+
+  agent["<b>MCP clients</b><br/>[Person]<br/>Claude Code, Cursor,<br/>claude.ai"]:::person
+
+  subgraph SERVER["memry serve · one process"]
+    direction TB
+    worker["<b>EnrichmentWorker</b><br/>[Component: asyncio task]<br/>drains pending memories"]:::comp
+    store["<b>MemoryStore</b><br/>[Component: Python]<br/>write path, reconcile,<br/>retrieval, upkeep"]:::comp
+    local["<b>LocalBackend</b><br/>[Component: Python, 5,000 lines]<br/>312 queries in SQLite dialect<br/>one in-process lock<br/>6 in-code migrations"]:::comp
+    worker -->|"process_pending"| store
+    store -->|"MemoryBackend contract"| local
+  end
+
+  subgraph DB["memry.db · SQLite file, WAL"]
+    direction TB
+    tables[("<b>Tables</b><br/>episodes, memories,<br/>entities, topics, relations")]:::db
+    fts[("<b>FTS5 indexes</b><br/>unicode61 + trigram tokenizers<br/>bm25() and fts5vocab")]:::dblogic
+    trig[("<b>16 triggers</b><br/>keep FTS and entity_names<br/>in step with the tables")]:::dblogic
+    uniq[("<b>Partial unique indexes</b><br/>one active topic<br/>per name and user")]:::dblogic
+  end
+
+  agent -->|"MCP tools"| store
+  local -->|"SQLite-dialect SQL"| tables
+  local -->|"MATCH, bm25()"| fts
+  tables -.->|"fire on write"| trig
+  tables -.->|"enforce"| uniq

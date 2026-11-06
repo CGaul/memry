@@ -2,13 +2,14 @@
 name: plan-refactoring
 description: Interactive interview that produces a well-structured GitHub refactoring ticket (behaviour-preserving redesign with a machine-checkable behavior-preservation contract) — the refactor entry point ahead of /design-implementation. Drives the codebase toward its target layering, grounded in the graphify knowledge graph.
 disable-model-invocation: false
-argument-hint: "[optional short refactoring topic]"
+argument-hint: "[short refactoring description] | --gh-issue <id>"
 ---
 
 # Plan GitHub Refactoring $ARGUMENTS
 
 Drive a **disciplined interview** with the user, then create a GitHub
-**refactoring** ticket in a fixed structured format that
+**refactoring** ticket (or restructure an existing issue in place) in a fixed
+structured format that
 `/design-implementation`, `/implement`, and the AWM orchestrator itself parse
 deterministically (AWM pins the exact section list below — drift means it
 treats the ticket as unstructured and re-plans it). It is the
@@ -23,6 +24,9 @@ Those gates plus the contract captures below are the verification currency.
 - Creates one GitHub issue (label `refactor` when it exists — never a priority
   or kind label), then writes `.gh-work/<n>/issue.json` — the completion signal
   AWM binds the workflow to — and `.gh-work/<n>/agent_context.md`.
+- **Existing-issue mode** (Step 0): restructures issue `<n>` in place — never a
+  new issue — and completes only on a fresh `.gh-work/<n>/issue.json` written
+  by this run, after the update.
 - Fetch `issue.json` only after the issue number is stamped into the Target
   Branch line (Step 8): AWM reads the branch from it.
 - The human signs off on the rendered draft before any GitHub write. This is a
@@ -90,7 +94,9 @@ mkdir -p "$WORK_DIR"
 ```
 
 The issue doesn't exist yet, so drafts live in this gitignored draft dir;
-Step 8 creates the real `.gh-work/<n>/`.
+Step 8 creates the real `.gh-work/<n>/`. In existing-issue mode the issue
+exists, but drafts still live here: `.gh-work/<n>/` receives nothing until
+Step 8.
 
 ## Operating principles — apply to the whole interview
 
@@ -132,12 +138,36 @@ Step 8 creates the real `.gh-work/<n>/`.
   AskUserQuestion — AWM can answer those from its UI; open questions stay free
   text.
 
+## Step 0 — Resolve the input mode
+
+1. **Free text** — `/plan-refactoring <topic>` (or no args): the normal
+   interview; creates a **new** issue in Step 7.
+2. **Existing issue** — the arguments carry `--gh-issue <n>`, or the
+   "Notes for the interview" say this is an existing GitHub issue to
+   restructure / "update issue #<n> itself". `<n>` is the issue to update.
+   Fetch it, body and comments, into the draft dir:
+
+   ```bash
+   command gh issue view <n> --comments --repo CGaul/memry > "$WORK_DIR/issue_<n>_original.md"
+   command gh issue view <n> --repo CGaul/memry --json body --jq .body > "$WORK_DIR/issue_<n>_body.md"
+   ```
+
+   This mode **updates the same issue** in Step 8 and skips Step 7 — never
+   `gh issue create`, never a duplicate. If the issue asks for a behaviour
+   change, the frozen-behaviour rule still holds: say so and agree with the
+   user what this refactor keeps.
+
 ## Step 1 — Scope opener
 
 Read `$ARGUMENTS` as the starting topic. If it already says what is
 structurally wrong and roughly what the end state is, use it; otherwise ask
 for that, at the level of modules and responsibilities. No "why it matters"
 needed.
+
+In existing-issue mode the fetched issue is the opener: draft every section
+from its body and comments, mark what you inferred with `_(inferred)_`, and
+ask only about real gaps. Keep the author's intent and content — restructure,
+don't rewrite the request.
 
 ## Step 2 — Ground and draft every section
 
@@ -257,6 +287,13 @@ order** (pinned in `REFACTORING_SECTIONS`): `## Refactoring Goal`,
 `## Alternatives Considered` — plus the optional `## Separation Line` last.
 Write it all to `$WORK_DIR/ticket_body.md`.
 
+In existing-issue mode, write the Target Branch with the existing number
+directly (`refactor/<n>_<branch-slug>`, no `NNN`), keep the issue's title
+unless the user approves a new one, and preserve the original report by
+appending it as a final `## Original report` section (after everything above)
+if it would otherwise be lost — quoted with `> ` on every line, so none of its
+own headings can be read as a ticket section.
+
 Write `$WORK_DIR/agent_context.md` alongside it — agent-facing, never posted
 to GitHub. It starts with:
 
@@ -316,6 +353,8 @@ command gh issue create --repo CGaul/memry \
 (The fallback covers a missing `refactor` label — never invent labels, and
 never add priority/kind labels: the `refactor/` branch prefix is the signal.)
 
+**Existing-issue mode: skip this step** — the issue is `<n>` from Step 0.
+
 ## Step 8 — Stamp the number + write the AWM bind artifacts
 
 Extract the issue number `<n>` from the returned URL, replace `NNN` in the
@@ -331,6 +370,14 @@ command gh api repos/CGaul/memry/issues/<n> > "$REPO_ROOT/.gh-work/<n>/issue.jso
 # next to issue.json (it is NOT posted to GitHub).
 cp "$WORK_DIR/agent_context.md" "$REPO_ROOT/.gh-work/<n>/agent_context.md"
 ```
+
+**Existing-issue mode**: `<n>` is the issue from Step 0 (add
+`--title "<title>"` to the edit only for an approved new title). Update the
+issue in place, copy `agent_context.md`, and write `issue.json` **last**, only
+after the edit succeeded — it is AWM's completion signal and must be written
+by this run. If the issue already passes Step 5 and the human confirms nothing
+should change, skip the edit but still re-fetch `issue.json` so the step
+completes, and say so.
 
 ## Step 9 — Report
 

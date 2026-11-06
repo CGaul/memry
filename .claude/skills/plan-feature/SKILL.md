@@ -2,14 +2,15 @@
 name: plan-feature
 description: Interactive interview that produces a well-structured GitHub feature ticket — the recommended entry point ahead of /design-implementation.
 disable-model-invocation: false
-argument-hint: "[optional short feature topic]"
+argument-hint: "[short feature description] | --gh-issue <id>"
 ---
 
 # Plan GitHub Feature $ARGUMENTS
 
 Drive a **disciplined interview** with the user, then create a GitHub feature
-ticket in a fixed structured format that `/design-implementation` and
-`/implement` can parse deterministically. Run **inline** in the main
+ticket (or restructure an existing issue in place) in a fixed structured
+format that `/design-implementation` and `/implement` can parse
+deterministically. Run **inline** in the main
 conversation — the user must see and refine each section verbatim.
 
 The repo is `CGaul/memry`.
@@ -19,6 +20,9 @@ The repo is `CGaul/memry`.
 - Creates one GitHub issue (label `feature` when it exists), then writes
   `.gh-work/<n>/issue.json` — the completion signal AWM binds the workflow to —
   plus one `.gh-work/<n>/<name>.openapi.yaml` per signed-off API contract.
+- **Existing-issue mode** (Step 0): restructures issue `<n>` in place — never a
+  new issue — and completes only on a fresh `.gh-work/<n>/issue.json` written
+  by this run, after the update.
 - Fetch `issue.json` only after the issue number is stamped into the Target
   Branch line (Step 7): AWM reads the branch from it.
 - The human signs off on the rendered draft before any GitHub write. This is a
@@ -49,10 +53,35 @@ The repo is `CGaul/memry`.
 
 ## Procedure
 
+### Step 0 — Resolve the input mode
+
+1. **Free text** — `/plan-feature <topic>` (or no args): the normal interview;
+   creates a **new** issue in Step 6.
+2. **Existing issue** — the arguments carry `--gh-issue <n>`, or the
+   "Notes for the interview" say this is an existing GitHub issue to
+   restructure / "update issue #<n> itself". `<n>` is the issue to update.
+   Fetch it, body and comments, into the draft dir:
+
+   ```bash
+   REPO_ROOT="$(git rev-parse --show-toplevel)"
+   WORK_DIR="$REPO_ROOT/.gh-work/draft-feature"   # gitignored; NOT .gh-work/<n>/
+   mkdir -p "$WORK_DIR"
+   command gh issue view <n> --comments --repo CGaul/memry > "$WORK_DIR/issue_<n>_original.md"
+   command gh issue view <n> --repo CGaul/memry --json body --jq .body > "$WORK_DIR/issue_<n>_body.md"
+   ```
+
+   This mode **updates the same issue** in Step 7 and skips Step 6 — never
+   `gh issue create`, never a duplicate.
+
 ### Step 1 — Opener
 
 Read `$ARGUMENTS` as the starting topic. If it already describes the feature,
 use it; otherwise ask the user to describe the feature in one short paragraph.
+
+In existing-issue mode the fetched issue is the opener: draft every section
+from its body and comments, mark what you inferred with `_(inferred)_`, and
+ask only about real gaps. Keep the author's intent and content — restructure,
+don't rewrite the request.
 
 ### Step 2 — Ground the draft
 
@@ -132,6 +161,14 @@ Show the full rendered draft and ask for approval (AskUserQuestion: approve /
 request changes). On change requests, revise and show it again. Do not create
 the issue without an explicit approval.
 
+In existing-issue mode the same gates apply (metadata block, sections,
+sign-off before any GitHub write — under AWM too). Write the Target Branch
+with the existing number directly (`feature/<n>_<branch-slug>`, no `NNN`).
+Keep the issue's title unless the user approves a new one. Preserve the
+original report by appending it under a final `## Original report` section if
+it would otherwise be lost — quoted with `> ` on every line, so none of its
+own headings can be read as a ticket section.
+
 ### Step 6 — Create the issue
 
 Derive a concise verb-phrase title. Then:
@@ -144,6 +181,8 @@ command gh issue create --repo CGaul/memry \
 ```
 
 (The fallback covers a missing `feature` label — never invent labels.)
+
+**Existing-issue mode: skip this step** — the issue is `<n>` from Step 0.
 
 ### Step 7 — Stamp the number + write the AWM artifact
 
@@ -163,6 +202,13 @@ When an API contract was drafted, also write each signed-off spec to
 The filename **must end in `.openapi.yaml`** — AWM's Artifacts tab detects
 that suffix and renders the file with Swagger UI. These specs are optional
 artifacts, not completion signals.
+
+**Existing-issue mode**: the same commands with `<n>` from Step 0 (add
+`--title "<title>"` only for an approved new title). Update the issue in place,
+write any `.openapi.yaml` specs, and write `issue.json` **last**, only after
+the edit succeeded — it is AWM's completion signal and must be written by this
+run. If the issue already passes and the human confirms nothing should change,
+skip the edit but still re-fetch `issue.json` so the step completes, and say so.
 
 ### Step 8 — Report
 
